@@ -1,0 +1,4 @@
+Task,Value,Source Chunk,Confidence,Notes
+合同金额,1000000,1,0.95,Mock extraction
+签署日期,2023-01-01,1,0.95,Mock extraction
+付款方式,"[500000, 500000]",1,0.95,Mock extraction
