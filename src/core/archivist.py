@@ -7,6 +7,19 @@ from docx.oxml.table import CT_Tbl
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 
+from src.core.llm import get_llm
+
+HIERARCHY_PATTERNS = [
+    (r"^(第[一二三四五六七八九十\d]+[卷册篇])", 1),  # Volume
+    (r"^(此页为合同签字页)$", 1),  # Special Page
+    (r"^(第[一二三四五六七八九十\d]+章)", 2),  # Chapter
+    (r"^([商务技术]*附件\s*\d+)", 3),  # Attachment
+    (r"^(\d+\.\d+\.\d+)(?!\.\d)", 4),  # Clause (X.X.X)
+    (r"^(\d+\.\d+)(?!\.\d)", 3),  # Section (X.X)
+    (r"^(第\d+[（(][A-Z][）)]条)", 3),  # Special Clause
+    (r"^(\d+(\.\d+)+)", -1),  # Dynamic fallback
+]
+
 class Archivist:
     def __init__(self, embedding_model_name: str = "qwen3-embedding-8B"):
         self.embedding_model_name = embedding_model_name
@@ -40,13 +53,13 @@ class Archivist:
                 if new_hierarchy != current_hierarchy:
                     # If hierarchy changed, flush the current buffer as a chunk
                     if current_text_buffer:
+                        # Flush current buffer with OLD hierarchy
                         self._add_text_chunks(chunks, current_text_buffer, current_hierarchy)
                         current_text_buffer = []
+                    
+                    # Start new buffer with the header text! (Header Alignment)
+                    current_text_buffer = [text]
                     current_hierarchy = new_hierarchy
-                    # If the paragraph itself was a header, we don't add it to the body text usually,
-                    # but it depends on preference. Let's include it in the hierarchy path but not the body?
-                    # Or maybe the header is just metadata. 
-                    # Let's assume the header text is part of the path, not the content chunk.
                 else:
                     # It's normal text, add to buffer
                     current_text_buffer.append(text)
@@ -62,9 +75,9 @@ class Archivist:
                 chunks.append({
                     "content": table_content,
                     "metadata": {
-                        "path": list(current_hierarchy),
+                        "path": "/".join(filter(None, current_hierarchy)),
                         "type": "table",
-                        "summary": "Placeholder summary for table"
+                        "summary": self._generate_summary(table_content)
                     }
                 })
         
@@ -79,31 +92,24 @@ class Archivist:
         Detect if the text is a header and update the hierarchy.
         Returns the new hierarchy list.
         """
-        # Regex for Chapter X
-        chapter_match = re.match(r'^(Chapter\s+\d+|第\d+章)', text, re.IGNORECASE)
-        if chapter_match:
-            return [text]
-        
-        # Regex for 1.1, 1.1.1
-        section_match = re.match(r'^(\d+(\.\d+)+)', text)
-        if section_match:
-            # Determine level based on dots
-            level_str = section_match.group(1)
-            level_depth = level_str.count('.') + 1
-            
-            # Determine depth:
-            # 1.1 -> 1 dot -> depth 2 (child of Chapter)
-            # 1.1.1 -> 2 dots -> depth 3
-            depth = level_str.count('.') + 1
-            
-            new_hierarchy = list(current_hierarchy)
-            
-            # Adjust hierarchy
-            if len(new_hierarchy) >= depth:
+        for pattern, depth in HIERARCHY_PATTERNS:
+            match = re.match(pattern, text, re.IGNORECASE)
+            if match:
+                if depth == -1:
+                    # Dynamic depth based on dots
+                    # 1.1 -> 1 dot -> depth 2
+                    level_str = match.group(1)
+                    depth = level_str.count('.') + 1
+                
+                # Ensure hierarchy is long enough (fill gaps with empty strings)
+                new_hierarchy = current_hierarchy[:]
+                while len(new_hierarchy) < depth - 1:
+                    new_hierarchy.append("")
+                
+                # Truncate and append
                 new_hierarchy = new_hierarchy[:depth-1]
-            
-            new_hierarchy.append(text)
-            return new_hierarchy
+                new_hierarchy.append(text)
+                return new_hierarchy
 
         return current_hierarchy
 
@@ -113,23 +119,18 @@ class Archivist:
         """
         full_text = "\n".join(text_buffer)
         
-        # Simple token count estimation (e.g. 1 word = 1.3 tokens or just char count for now)
-        # Prompt says "500 token overlap". Let's assume 1 token ~ 4 chars for English, 
-        # but for Chinese/General it's complex.
-        # Let's use a simple character limit for "chunking" as a proxy if we don't have a tokenizer.
-        # 500 tokens ~ 2000 chars?
-        # Let's assume a chunk size of 1000 tokens (~4000 chars) with 500 token (~2000 chars) overlap.
-        
         CHUNK_SIZE = 4000
         OVERLAP = 2000
+        
+        path_str = "/".join(filter(None, hierarchy))
         
         if len(full_text) <= CHUNK_SIZE:
             chunks.append({
                 "content": full_text,
                 "metadata": {
-                    "path": list(hierarchy),
+                    "path": path_str,
                     "type": "text",
-                    "summary": "Placeholder summary"
+                    "summary": self._generate_summary(full_text)
                 }
             })
         else:
@@ -141,14 +142,68 @@ class Archivist:
                 chunks.append({
                     "content": chunk_text,
                     "metadata": {
-                        "path": list(hierarchy),
+                        "path": path_str,
                         "type": "text",
-                        "summary": "Placeholder summary"
+                        "summary": self._generate_summary(chunk_text)
                     }
                 })
                 if end >= len(full_text):
                     break
                 start += (CHUNK_SIZE - OVERLAP)
+
+    def _generate_summary(self, text: str) -> str:
+        """
+        Generate a summary of the text using LLM.
+        """
+        try:
+            llm = get_llm("gpt-4o-mini") # Using a lightweight model for summary
+            messages = [
+                ("system", "You are a helpful assistant that summarizes legal document chunks."),
+                ("human", f"Summarize the following text concisely within 50 words:\n\n{text[:2000]}")
+            ]
+            response = llm.invoke(messages)
+            return response.content
+        except Exception as e:
+            return f"Error generating summary: {str(e)}"
+
+    def generate_document_structure(self, chunks: List[Dict[str, Any]]) -> str:
+        """
+        Generate a readable tree structure from the paths in the chunks.
+        """
+        structure = []
+        
+        def find_child(nodes, name):
+            for node in nodes:
+                if node['name'] == name:
+                    return node
+            return None
+
+        for chunk in chunks:
+            path = chunk.get('metadata', {}).get('path', [])
+            if not path:
+                continue
+            
+            # If path is a string, split it
+            if isinstance(path, str):
+                path = path.split('/')
+                
+            current_level = structure
+            for part in path:
+                node = find_child(current_level, part)
+                if not node:
+                    node = {'name': part, 'children': []}
+                    current_level.append(node)
+                current_level = node['children']
+        
+        # Convert to string
+        lines = []
+        def build_string(nodes, indent=0):
+            for node in nodes:
+                lines.append("  " * indent + node['name'])
+                build_string(node['children'], indent + 1)
+        
+        build_string(structure)
+        return "\n".join(lines)
 
     def _extract_table_content(self, table: Table) -> str:
         """

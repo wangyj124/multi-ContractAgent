@@ -11,16 +11,6 @@ from src.core.schema import ExtractionResult
 from src.tools.lookup import LookupToolSet
 from src.core.retriever import Retriever
 
-# Define the extraction tasks (XT list)
-XT_TASKS = [
-    "Total Amount",
-    "Effective Date",
-    "Vendor Name",
-    "Contract Term",
-    "Sign Date",
-    "Installment Amounts"
-]
-
 # Initialize Retriever and Tools (Globals for now, ideally injected)
 # We use a singleton pattern or just module level for simplicity
 # In a real app, this might be initialized in main and passed around
@@ -34,10 +24,12 @@ def supervisor_node(state: AgentState) -> Dict[str, Any]:
     It identifies the next task and decides which tool to use to retrieve information.
     """
     extraction_results = state.get("extraction_results", {}) or {}
+    task_list = state.get("task_list", [])
+    document_structure = state.get("document_structure", "")
     
     # 1. Identify next missing field
     next_task = None
-    for task in XT_TASKS:
+    for task in task_list:
         if task not in extraction_results:
             next_task = task
             break
@@ -53,13 +45,17 @@ def supervisor_node(state: AgentState) -> Dict[str, Any]:
     llm = get_llm("gpt-4o", temperature=0) # Use a smart model for supervision
     llm_with_tools = llm.bind_tools(tools)
     
-    system_prompt = """You are a supervisor agent responsible for extracting contract information.
-    Your goal is to find information for the current task: "{task}".
+    system_prompt = f"""You are a supervisor agent responsible for extracting contract information.
+    Your goal is to find information for the current task: "{{task}}".
     You have access to tools to search the document.
+
+    Document Structure:
+    {document_structure}
+
     - structural_lookup: Use if you know the likely section (e.g. "Payment Terms").
     - semantic_fallback: Use to search by meaning (e.g. "How much is the contract worth?").
     
-    Decide which tool to use to find the information for "{task}".
+    Decide which tool to use to find the information for "{{task}}".
     """
     
     prompt = ChatPromptTemplate.from_messages([

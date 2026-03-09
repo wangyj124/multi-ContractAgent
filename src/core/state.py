@@ -21,3 +21,6 @@ class AgentState(TypedDict):
     
     # Document structure context for the supervisor
     document_structure: str
+
+    # Dynamic list of tasks to extract
+    task_list: List[str]

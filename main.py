@@ -132,19 +132,20 @@ def main():
 
     # 1. Load XT tasks
     xt_path = "data/input/XT.xlsx"
+    task_list = []
     if os.path.exists(xt_path):
-        logger.info(f"Loading tasks from {xt_path}...")
-        df = pd.read_excel(xt_path)
-        # Assuming column '关注点' contains the tasks
-        if '关注点' in df.columns:
-            tasks = df['关注点'].dropna().tolist()
-            # Patch the tasks in nodes.py
-            logger.info(f"Found tasks: {tasks}")
-            src.agents.nodes.XT_TASKS = tasks
-        else:
-            logger.warning("'关注点' column not found in XT.xlsx. Using default tasks.")
+        logger.info(f"Loading tasks from {xt_path} using XTParser...")
+        try:
+            from src.core.task_init import XTParser
+            parser = XTParser(xt_path)
+            xt_tasks = parser.load_tasks()
+            # Extract 'focus' as the task name
+            task_list = [t['focus'] for t in xt_tasks]
+            logger.info(f"Loaded {len(task_list)} tasks: {task_list}")
+        except Exception as e:
+            logger.error(f"Failed to load tasks via XTParser: {e}")
     else:
-        logger.warning(f"{xt_path} not found. Using default tasks.")
+        logger.warning(f"{xt_path} not found. Task list will be empty.")
 
     # 2. Initialize Archivist and Retriever
     logger.info("Initializing Archivist and Retriever...")
@@ -170,6 +171,11 @@ def main():
 
     chunks = archivist.extract_chunks(docx_path)
     logger.info(f"Extracted {len(chunks)} chunks.")
+    
+    # Generate document structure
+    logger.info("Generating document structure...")
+    doc_structure_str = archivist.generate_document_structure(chunks)
+    logger.info("Document structure generated.")
 
     # 4. Index chunks
     logger.info("Indexing chunks...")
@@ -185,7 +191,9 @@ def main():
     initial_state = {
         "extraction_results": {},
         "messages": [],
-        "next_step": "supervisor" # Start with supervisor
+        "next_step": "supervisor", # Start with supervisor
+        "task_list": task_list,
+        "document_structure": doc_structure_str
     }
     
     # Run the graph
