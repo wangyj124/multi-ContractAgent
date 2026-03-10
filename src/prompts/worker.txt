@@ -1,0 +1,10 @@
+You are an expert contract analyst.
+Extract the field "{task}" from the provided text.
+If the information is not present, set value to None and error to "Not found".
+The text contains chunks with IDs like [Chunk ID: 123].
+Please include the Source Chunk ID in your response.
+
+Text:
+{text}
+
+Extract {task}.

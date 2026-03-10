@@ -15,6 +15,8 @@ from src.core.workflow import create_graph
 from src.core.schema import ExtractionResult
 import src.core.llm
 import src.agents.nodes
+import src.core.archivist
+import src.tools.lookup
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,7 +31,7 @@ if not os.environ.get("OPENAI_API_KEY"):
     USE_MOCK_LLM = True
 
 # Mock classes
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig
 from pydantic import BaseModel
@@ -47,17 +49,42 @@ class MockLLM(Runnable):
     def invoke(self, input, config: Optional[RunnableConfig] = None, **kwargs):
         # Handle Supervisor
         if self.mode == "supervisor":
-            # Input is list of messages
-            # Last message is HumanMessage with "Find information for {task}"
-            if isinstance(input, list) and len(input) > 0:
-                last_msg = input[-1].content
-                task = last_msg.replace("Find information for ", "")
+            messages = []
+            if hasattr(input, "to_messages"):
+                messages = input.to_messages()
+                if messages:
+                    last_msg = messages[-1].content
+                    if isinstance(last_msg, str):
+                        task = last_msg.replace("Find information for ", "")
+                    else:
+                        task = ""
+                else:
+                    task = ""
+            elif isinstance(input, list):
+                messages = input
+                if len(input) > 0:
+                    last_msg = input[-1].content
+                    task = last_msg.replace("Find information for ", "")
+                else:
+                    task = ""
             elif isinstance(input, dict):
-                 task = input.get("task", "")
+                messages = input.get("messages", [])
+                task = input.get("task", "")
+                if not task and messages:
+                    last_msg = messages[-1].content
+                    if isinstance(last_msg, str):
+                        task = last_msg.replace("Find information for ", "")
             else:
                 task = str(input)
 
             logger.info(f"[Mock Supervisor] Processing task: {task}")
+            
+            # Check for previous failures to avoid loops
+            if messages:
+                for msg in reversed(messages):
+                    if isinstance(msg, ToolMessage) and "No content found" in msg.content:
+                        logger.info("[Mock Supervisor] Previous tool call failed. Returning Final Answer.")
+                        return AIMessage(content="Final Answer: Unable to find information with mock tools.")
             
             tool_name = "structural_lookup"
             tool_args = {"path": "Chapter 1"} # Default
@@ -118,6 +145,17 @@ class MockLLM(Runnable):
                 validation_notes="Mock extraction"
             )
 
+        # Handle Default (Reranking, Summarization, etc.)
+        content_str = str(input)
+        if isinstance(input, list) and len(input) > 0:
+             content_str = input[-1].content
+        
+        if "Score the following text" in content_str or "relevance score" in content_str:
+             return AIMessage(content="Score: 9\nReasoning: Highly relevant mock content.")
+        
+        if "Summarize" in content_str or "summarize" in content_str:
+             return AIMessage(content="Summary: This is a mock summary of the content.")
+
         return AIMessage(content="Mock response")
 
 def mock_get_llm(model_name: str, temperature: float = 0):
@@ -127,8 +165,15 @@ def main():
     # Monkeypatch if needed
     if USE_MOCK_LLM:
         logger.info("Monkeypatching get_llm...")
+        # Patch the original source
         src.core.llm.get_llm = mock_get_llm
+        
+        # Patch all modules that imported it
         src.agents.nodes.get_llm = mock_get_llm
+        
+        src.core.archivist.get_llm = mock_get_llm
+        
+        src.tools.lookup.get_llm = mock_get_llm
 
     # 1. Load XT tasks
     xt_path = "data/input/XT.xlsx"
@@ -192,6 +237,7 @@ def main():
         "extraction_results": {},
         "messages": [],
         "next_step": "supervisor", # Start with supervisor
+        "task_status": "Initial_Search",
         "task_list": task_list,
         "document_structure": doc_structure_str
     }

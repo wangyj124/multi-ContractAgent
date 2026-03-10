@@ -22,7 +22,7 @@ def create_graph():
     workflow.set_entry_point("supervisor")
 
     # Define conditional edges from supervisor
-    def supervisor_router(state: AgentState) -> Literal["tools", "end"]:
+    def supervisor_router(state: AgentState) -> Literal["tools", "worker", "end"]:
         # Check next_step
         next_step = state.get("next_step")
         if next_step == "finish":
@@ -30,9 +30,13 @@ def create_graph():
         
         # If tool calls are present in the last message, go to tools
         messages = state.get("messages", [])
-        if messages and hasattr(messages[-1], "tool_calls") and messages[-1].tool_calls:
-            return "tools"
-            
+        if messages:
+            last_message = messages[-1]
+            if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                return "tools"
+            if "Final Answer" in last_message.content:
+                return "worker"
+                
         # Fallback (should not happen in this design if supervisor always calls tools)
         return "end"
 
@@ -41,13 +45,14 @@ def create_graph():
         supervisor_router,
         {
             "tools": "tools",
+            "worker": "worker",
             "end": END
         }
     )
 
     # Define edges
-    # From tools to worker (as per requirement)
-    workflow.add_edge("tools", "worker")
+    # From tools back to supervisor (loop)
+    workflow.add_edge("tools", "supervisor")
     
     # From worker to validator
     workflow.add_edge("worker", "validator")

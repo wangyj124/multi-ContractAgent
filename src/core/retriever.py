@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Union
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.http import models
+    from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchText
 except ImportError:
     raise ImportError("Please install qdrant-client first.")
 
@@ -168,14 +169,25 @@ class Retriever:
             print(f"Error retrieving context for chunk {chunk_id}: {e}")
             return []
 
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, filter: Optional[Union[Dict[str, Any], models.Filter]] = None) -> List[Dict[str, Any]]:
         """
         Semantic search.
+        
+        Args:
+            query: Search query
+            k: Number of results to return
+            filter: Optional Qdrant filter (dict or Filter object)
         """
         query_vector = self._get_embedding(query)
+        
+        # If filter is a dict, we assume it's a Qdrant Filter structure or custom dict
+        # Ideally, caller should pass models.Filter
+        query_filter = filter
+        
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
+            query_filter=query_filter,
             limit=k
         ).points
         

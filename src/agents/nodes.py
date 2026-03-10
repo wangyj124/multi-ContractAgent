@@ -3,13 +3,22 @@ from typing import List, Dict, Any, Literal, Optional
 
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from pathlib import Path
 
 from src.core.state import AgentState
 from src.core.llm import get_llm
 from src.core.schema import ExtractionResult
 from src.tools.lookup import LookupToolSet
 from src.core.retriever import Retriever
+
+def _load_prompt(prompt_name: str) -> str:
+    base_path = Path(__file__).parent.parent / "prompts"
+    prompt_path = base_path / f"{prompt_name}.txt"
+    if not prompt_path.exists():
+         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 # Initialize Retriever and Tools (Globals for now, ideally injected)
 # We use a singleton pattern or just module level for simplicity
@@ -45,27 +54,24 @@ def supervisor_node(state: AgentState) -> Dict[str, Any]:
     llm = get_llm("gpt-4o", temperature=0) # Use a smart model for supervision
     llm_with_tools = llm.bind_tools(tools)
     
-    system_prompt = f"""You are a supervisor agent responsible for extracting contract information.
-    Your goal is to find information for the current task: "{{task}}".
-    You have access to tools to search the document.
-
-    Document Structure:
-    {document_structure}
-
-    - structural_lookup: Use if you know the likely section (e.g. "Payment Terms").
-    - semantic_fallback: Use to search by meaning (e.g. "How much is the contract worth?").
-    
-    Decide which tool to use to find the information for "{{task}}".
-    """
-    
+    prompt_text = _load_prompt("supervisor")
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "Find information for {task}")
+        ("system", prompt_text),
+        MessagesPlaceholder(variable_name="messages")
     ])
     
     chain = prompt | llm_with_tools
     
-    response = chain.invoke({"task": next_task})
+    # Sliding window for messages
+    messages = state.get("messages", [])
+    if len(messages) > 3:
+        messages = messages[-3:]
+    
+    response = chain.invoke({
+        "task": next_task, 
+        "document_structure": document_structure,
+        "messages": messages
+    })
     
     return {
         "next_step": "tools",
@@ -101,17 +107,8 @@ def worker_node(state: AgentState) -> Dict[str, Any]:
     # We want structured output
     structured_llm = llm.with_structured_output(ExtractionResult)
     
-    system_prompt = """You are an expert contract analyst.
-    Extract the field "{task}" from the provided text.
-    If the information is not present, set value to None and error to "Not found".
-    The text contains chunks with IDs like [Chunk ID: 123].
-    Please include the Source Chunk ID in your response.
-    """
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "Text:\n{text}\n\nExtract {task}.")
-    ])
+    prompt_text = _load_prompt("worker")
+    prompt = ChatPromptTemplate.from_template(prompt_text)
     
     chain = prompt | structured_llm
     
@@ -218,6 +215,22 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
         
     # Update state with modified result
     extraction_results[current_task] = result_data
+    
+    # If validation failed (notes added), create feedback message and force retry
+    if notes:
+        # We remove the task from extraction_results so supervisor sees it as missing and retries
+        if current_task in extraction_results:
+            del extraction_results[current_task]
+            
+        feedback_msg = HumanMessage(
+            content=f"Validation Failed for task '{current_task}': {'; '.join(notes)}. Please try to find the correct information again.",
+            name="validator"
+        )
+        return {
+            "extraction_results": extraction_results,
+            "next_step": "supervisor",
+            "messages": [feedback_msg]
+        }
         
     return {
         "extraction_results": extraction_results,

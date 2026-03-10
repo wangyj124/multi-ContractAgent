@@ -36,11 +36,9 @@ def test_workflow_execution(mock_llm):
     supervisor_llm.bind_tools.return_value = supervisor_with_tools
     
     # We want supervisor to return a tool call for the first task "Total Amount"
-    # And then maybe stop or continue.
-    # Since the graph loops, we need to handle multiple calls if we want to test full loop.
-    # Let's test one iteration.
+    # And then return "Final Answer" to trigger worker.
     
-    supervisor_response = AIMessage(
+    supervisor_response_tool = AIMessage(
         content="",
         tool_calls=[{
             "name": "structural_lookup",
@@ -48,8 +46,27 @@ def test_workflow_execution(mock_llm):
             "id": "call_123"
         }]
     )
-    supervisor_with_tools.invoke.return_value = supervisor_response
-    supervisor_with_tools.return_value = supervisor_response
+    
+    supervisor_response_final = AIMessage(
+        content="Final Answer",
+        tool_calls=[]
+    )
+    
+    # Sequence:
+    # 1. Task 1: Call Tool
+    # 2. Task 1: Final Answer (Router -> Worker)
+    # 3. Task 2: Call Tool
+    # 4. Task 2: Final Answer (Router -> Worker)
+    # 5. Finish (Task list empty) -> handled by supervisor_node returning next_step="finish" before invoking LLM?
+    # Wait, supervisor_node checks task_list first. If empty, returns finish. LLM not invoked.
+    # So we need 4 responses for the 2 tasks.
+    
+    supervisor_with_tools.side_effect = [
+        supervisor_response_tool,
+        supervisor_response_final,
+        supervisor_response_tool,
+        supervisor_response_final
+    ]
     
     # Worker chain mocking
     # It calls with_structured_output then invoke
@@ -62,7 +79,8 @@ def test_workflow_execution(mock_llm):
         source_snippet="Total Amount: $1000",
         source_chunk_id=123
     )
-    worker_structured.invoke.return_value = worker_result
+    # Worker is called twice (once per task)
+    # Since it's treated as callable in the chain
     worker_structured.return_value = worker_result
     
     # Run the graph
@@ -71,55 +89,38 @@ def test_workflow_execution(mock_llm):
     # Initial state
     initial_state = {
         "messages": [],
-        "extraction_results": {}
+        "extraction_results": {},
+        "task_list": ["Total Amount", "Effective Date"]
     }
     
-    # Execute one step (or until interrupt)
-    # Since we didn't mock the tool execution, the ToolNode will try to execute "structural_lookup".
-    # We need to make sure "structural_lookup" works or is mocked.
-    # It uses the real LookupToolSet which uses real Retriever (mocked backend).
-    # So it should be fine, just returns "No content found" if empty.
-    
-    # We can inject some data into Retriever to make it return something.
+    # Inject data
     from src.agents.nodes import _retriever
     _retriever.index_chunks([{"text": "The Total Amount is $1000.", "path": "Payment/1.1"}])
     
     # Run
-    # We use stream to see steps
-    events = list(app.stream(initial_state, stream_mode="values"))
+    # Increase recursion limit just in case
+    events = list(app.stream(initial_state, config={"recursion_limit": 20}, stream_mode="values"))
     
     # Check results
     final_state = events[-1]
     
-    # Verify Supervisor was called
-    assert supervisor_with_tools.invoke.called or supervisor_with_tools.called
+    # Verify Supervisor was called multiple times
+    assert supervisor_with_tools.call_count >= 2
     
-    # Verify Worker was called
-    assert worker_structured.invoke.called or worker_structured.called
+    # Verify Worker was called multiple times
+    assert worker_structured.call_count >= 1
     
     # Verify Extraction Results
     results = final_state.get("extraction_results", {})
     assert "Total Amount" in results
     assert results["Total Amount"]["value"] == 1000.0
     
-    # Verify loop behavior
-    # The supervisor should have been called again for the next task
-    # But our mock supervisor returns the same thing every time?
-    # If it returns "structural_lookup" again, it might loop indefinitely if we don't handle it.
-    # However, `supervisor_node` logic:
-    # 1. Identify next missing field.
-    # If "Total Amount" is done, next is "Effective Date".
-    # So supervisor is called with "Effective Date".
-    # Our mock returns "structural_lookup" (path="Payment") again.
-    # That's fine, tool executes, worker extracts (same mock result).
-    # It will overwrite "Total Amount" if the task was "Total Amount".
-    # But since task is "Effective Date", worker will extract "Effective Date" with value 1000.0 (mock).
-    # So eventually all tasks will be filled.
-    
-    # To prevent infinite loop if something goes wrong, LangGraph has recursion limit.
-    # But let's check if we have at least one success.
-    
-    assert len(results) >= 1
+    # Since we mocked worker to return same result for both tasks, 
+    # "Effective Date" will also have value 1000.0 (and field_name "Total Amount" inside the object, technically mismatch but works for test)
+    # Actually worker_node uses current_task to prompt, but our mock returns fixed object.
+    # The node puts it into extraction_results[current_task].
+    assert "Effective Date" in results
+
 
 def test_validator_logic():
     """
@@ -143,9 +144,12 @@ def test_validator_logic():
             }
         }
         result = validator_node(state)
-        res_data = result["extraction_results"]["Vendor Name"]
-        assert res_data["value"] is None
-        assert "Original Empty" in res_data["validation_notes"]
+        # With new logic, if notes are present, the task is removed from results to trigger retry
+        # and a message is added.
+        assert "Vendor Name" not in result["extraction_results"]
+        assert "messages" in result
+        assert len(result["messages"]) == 1
+        assert "Original Empty" in result["messages"][0].content
         assert mock_retriever.get_context.called
         
         # Test 2: Date Order
@@ -162,8 +166,9 @@ def test_validator_logic():
             }
         }
         result = validator_node(state)
-        res_data = result["extraction_results"]["Effective Date"]
-        assert "before Sign Date" in res_data["validation_notes"]
+        assert "Effective Date" not in result["extraction_results"]
+        assert "messages" in result
+        assert "before Sign Date" in result["messages"][0].content
         assert mock_retriever.get_context.called
 
         # Test 3: Amount Conservation
@@ -180,8 +185,9 @@ def test_validator_logic():
             }
         }
         result = validator_node(state)
-        res_data = result["extraction_results"]["Total Amount"]
-        assert "Sum of installments" in res_data["validation_notes"]
+        assert "Total Amount" not in result["extraction_results"]
+        assert "messages" in result
+        assert "Sum of installments" in result["messages"][0].content
         assert mock_retriever.get_context.called
 
 if __name__ == "__main__":

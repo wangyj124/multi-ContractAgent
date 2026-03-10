@@ -66,13 +66,16 @@ class TestNodesDynamic(unittest.TestCase):
             self.assertEqual(system_msg_tuple[0], "system")
             system_prompt_content = system_msg_tuple[1]
             
-            # Verify document structure is in prompt
+            # Verify document structure is in prompt template
             self.assertIn("Document Structure:", system_prompt_content)
-            self.assertIn("Section 1: Header", system_prompt_content)
-            self.assertIn("Section 2: Body", system_prompt_content)
+            self.assertIn("{document_structure}", system_prompt_content)
             
             # Verify chain invocation
-            mock_chain.invoke.assert_called_with({"task": "Task B"})
+            mock_chain.invoke.assert_called_with({
+                "task": "Task B", 
+                "document_structure": "Section 1: Header\nSection 2: Body",
+                "messages": []
+            })
 
     def test_supervisor_node_all_tasks_done(self):
         state: AgentState = {

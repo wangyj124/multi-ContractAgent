@@ -14,6 +14,9 @@ class AgentState(TypedDict):
     
     # Current extraction task (e.g. "Total Amount")
     current_task: str
+
+    # Status of the current task (e.g., "pending", "in_progress", "completed", "failed")
+    task_status: str
     
     # Final extraction results
     # Key: field name, Value: extraction result
