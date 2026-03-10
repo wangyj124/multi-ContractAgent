@@ -1,6 +1,7 @@
 import uuid
 import hashlib
 import random
+import os
 from typing import List, Dict, Any, Optional, Union
 try:
     from qdrant_client import QdrantClient
@@ -14,6 +15,12 @@ try:
     FASTEMBED_AVAILABLE = True
 except ImportError:
     FASTEMBED_AVAILABLE = False
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 class Retriever:
     def __init__(self, location: str = ":memory:", collection_name: str = "contract_chunks", embedding_model: str = "mock"):
@@ -41,6 +48,32 @@ class Retriever:
             else:
                 print("FastEmbed not available, falling back to mock embeddings.")
                 self.embedding_model = "mock"
+        
+        elif self.embedding_model == "openai" or self.embedding_model == "qwen3-embedding":
+            if OPENAI_AVAILABLE:
+                base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                api_key = os.environ.get("OPENAI_API_KEY", "sk-proj-...")
+                # If model name is just "openai", default to text-embedding-3-small
+                model_name = "text-embedding-3-small" if self.embedding_model == "openai" else self.embedding_model
+                
+                self.embedder = OpenAIEmbeddings(
+                    model=model_name,
+                    openai_api_base=base_url,
+                    openai_api_key=api_key,
+                    check_embedding_ctx_length=False
+                )
+                
+                # Determine dimension by embedding a sample
+                try:
+                    # We do a quick check to ensure connectivity and get dimension
+                    sample = self.embedder.embed_query("test")
+                    self.embedding_dim = len(sample)
+                except Exception as e:
+                    print(f"Error initializing OpenAI embeddings ({model_name}): {e}. Falling back to mock.")
+                    self.embedding_model = "mock"
+            else:
+                print("langchain-openai not available, falling back to mock embeddings.")
+                self.embedding_model = "mock"
 
         # Initialize collection
         if self.client.collection_exists(self.collection_name):
@@ -61,6 +94,8 @@ class Retriever:
         if self.embedding_model == "fastembed" and FASTEMBED_AVAILABLE:
             # fastembed returns a generator of embeddings
             return list(self.embedder.embed([text]))[0]
+        elif (self.embedding_model == "openai" or self.embedding_model == "qwen3-embedding") and OPENAI_AVAILABLE:
+             return self.embedder.embed_query(text)
         else:
             # Mock embedding: deterministic random vector based on text hash
             # Use md5 hash of text to seed random to ensure same text gets same vector

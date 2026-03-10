@@ -1,4 +1,4 @@
-Task,Value,Source Chunk,Confidence,Notes
-合同金额,1000000,1,0.95,Mock extraction
-签署日期,2023-01-01,1,0.95,Mock extraction
-付款方式,"[500000, 500000]",1,0.95,Mock extraction
+Task,Value,Source Chunk,Confidence,Notes,Navigation History,Failure Reason
+合同金额,1000000,1,0.95,模拟提取,"[""工具调用: structural_lookup ({'path': 'Chapter 2'})"", '工具输出: 未找到路径的内容：Chapter 2']",
+签署日期,2023-01-01,1,0.95,模拟提取,"[""工具调用: structural_lookup ({'path': 'Chapter 2'})"", '工具输出: 未找到路径的内容：Chapter 2']",
+付款方式,"[500000, 500000]",1,0.95,模拟提取,"[""工具调用: structural_lookup ({'path': 'Chapter 2'})"", '工具输出: 未找到路径的内容：Chapter 2']",

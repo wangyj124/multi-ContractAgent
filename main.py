@@ -4,6 +4,7 @@ import logging
 import pandas as pd
 from typing import List, Dict, Any, Optional
 import uuid
+from tqdm import tqdm
 from unittest.mock import MagicMock
 
 # Add src to path if needed
@@ -47,44 +48,40 @@ class MockLLM(Runnable):
         return MockLLM(mode="worker")
 
     def invoke(self, input, config: Optional[RunnableConfig] = None, **kwargs):
+        # Normalize input to messages if possible
+        messages = []
+        if hasattr(input, "to_messages"):
+            messages = input.to_messages()
+        elif isinstance(input, list):
+            messages = input
+        
         # Handle Supervisor
         if self.mode == "supervisor":
-            messages = []
-            if hasattr(input, "to_messages"):
-                messages = input.to_messages()
-                if messages:
-                    last_msg = messages[-1].content
-                    if isinstance(last_msg, str):
-                        task = last_msg.replace("Find information for ", "")
-                    else:
-                        task = ""
-                else:
-                    task = ""
-            elif isinstance(input, list):
-                messages = input
-                if len(input) > 0:
-                    last_msg = input[-1].content
+            task = ""
+            if messages:
+                last_msg = messages[-1].content
+                if isinstance(last_msg, str):
                     task = last_msg.replace("Find information for ", "")
-                else:
-                    task = ""
             elif isinstance(input, dict):
-                messages = input.get("messages", [])
+                # Fallback for dict input if not converted to messages
                 task = input.get("task", "")
-                if not task and messages:
-                    last_msg = messages[-1].content
-                    if isinstance(last_msg, str):
-                        task = last_msg.replace("Find information for ", "")
+                if not task and input.get("messages"):
+                     msgs = input.get("messages")
+                     if msgs:
+                         last_msg = msgs[-1].content
+                         if isinstance(last_msg, str):
+                             task = last_msg.replace("Find information for ", "")
             else:
                 task = str(input)
 
-            logger.info(f"[Mock Supervisor] Processing task: {task}")
+            logger.info(f"[模拟主管] 正在处理任务: {task}")
             
             # Check for previous failures to avoid loops
             if messages:
                 for msg in reversed(messages):
-                    if isinstance(msg, ToolMessage) and "No content found" in msg.content:
-                        logger.info("[Mock Supervisor] Previous tool call failed. Returning Final Answer.")
-                        return AIMessage(content="Final Answer: Unable to find information with mock tools.")
+                    if isinstance(msg, ToolMessage) and "未找到" in msg.content:
+                        logger.info("[模拟主管] 上一次工具调用失败。返回最终答案。")
+                        return AIMessage(content="最终答案：无法使用模拟工具找到信息。")
             
             tool_name = "structural_lookup"
             tool_args = {"path": "Chapter 1"} # Default
@@ -109,22 +106,26 @@ class MockLLM(Runnable):
         # Handle Worker
         elif self.mode == "worker":
             # Input is list of messages
-            # Last message: "Text:\n{text}\n\nExtract {task}."
-            if isinstance(input, list) and len(input) > 0:
-                content = input[-1].content
+            content = ""
+            if messages:
+                content = messages[-1].content
             elif isinstance(input, dict):
                 content = input.get("text", "") + " " + input.get("task", "")
             else:
                 content = str(input)
 
             # Extract task name from prompt if possible
-            task = "Unknown"
-            if "Extract " in content:
+            task = "未知"
+            # Debug logging
+            # logger.info(f"DEBUG: content type: {type(content)}")
+            # logger.info(f"DEBUG: content preview: {str(content)[-100:]}")
+            
+            if "提取 " in str(content):
                 # "Extract {task}." -> split by "Extract " take last, remove "."
                 # But task might be at end.
-                task = content.split("Extract ")[-1].strip().rstrip(".")
+                task = str(content).split("提取 ")[-1].strip().rstrip(".")
             
-            logger.info(f"[Mock Worker] Extracting for task: {task}")
+            logger.info(f"[模拟工人] 正在提取任务: {task}")
 
             # Return mock result based on task keywords
             value = "Mock Value"
@@ -142,7 +143,7 @@ class MockLLM(Runnable):
                 value=value,
                 source_chunk_id=1,
                 confidence=0.95,
-                validation_notes="Mock extraction"
+                validation_notes="模拟提取"
             )
 
         # Handle Default (Reranking, Summarization, etc.)
@@ -150,13 +151,13 @@ class MockLLM(Runnable):
         if isinstance(input, list) and len(input) > 0:
              content_str = input[-1].content
         
-        if "Score the following text" in content_str or "relevance score" in content_str:
-             return AIMessage(content="Score: 9\nReasoning: Highly relevant mock content.")
+        if "Score the following text" in content_str or "relevance score" in content_str or "评分" in content_str:
+             return AIMessage(content="评分：9\n理由：高度相关的模拟内容。")
         
-        if "Summarize" in content_str or "summarize" in content_str:
-             return AIMessage(content="Summary: This is a mock summary of the content.")
+        if "Summarize" in content_str or "summarize" in content_str or "总结" in content_str:
+             return AIMessage(content="摘要：这是内容的模拟摘要。")
 
-        return AIMessage(content="Mock response")
+        return AIMessage(content="模拟响应")
 
 def mock_get_llm(model_name: str, temperature: float = 0):
     return MockLLM()
@@ -164,7 +165,7 @@ def mock_get_llm(model_name: str, temperature: float = 0):
 def main():
     # Monkeypatch if needed
     if USE_MOCK_LLM:
-        logger.info("Monkeypatching get_llm...")
+        logger.info("正在修补 get_llm...")
         # Patch the original source
         src.core.llm.get_llm = mock_get_llm
         
@@ -179,21 +180,21 @@ def main():
     xt_path = "data/input/XT.xlsx"
     task_list = []
     if os.path.exists(xt_path):
-        logger.info(f"Loading tasks from {xt_path} using XTParser...")
+        logger.info(f"正在使用 XTParser 加载任务...")
         try:
             from src.core.task_init import XTParser
             parser = XTParser(xt_path)
             xt_tasks = parser.load_tasks()
             # Extract 'focus' as the task name
             task_list = [t['focus'] for t in xt_tasks]
-            logger.info(f"Loaded {len(task_list)} tasks: {task_list}")
+            logger.info(f"已加载 {len(task_list)} 个任务: {task_list}")
         except Exception as e:
-            logger.error(f"Failed to load tasks via XTParser: {e}")
+            logger.error(f"通过 XTParser 加载任务失败: {e}")
     else:
-        logger.warning(f"{xt_path} not found. Task list will be empty.")
+        logger.warning(f"{xt_path} 未找到。任务列表将为空。")
 
     # 2. Initialize Archivist and Retriever
-    logger.info("Initializing Archivist and Retriever...")
+    logger.info("正在初始化 Archivist 和 Retriever...")
     archivist = Archivist() # Defaults to mock embedding internally
     # Use memory for Qdrant and mock embeddings
     retriever = Retriever(location=":memory:", collection_name="contract_chunks", embedding_model="mock")
@@ -201,7 +202,7 @@ def main():
     # Inject retriever into nodes (since nodes.py initializes its own global)
     # We need to update the global _retriever in src.agents.nodes
     # and also re-initialize the tools because tools bind the retriever.
-    logger.info("Injecting Retriever into agents...")
+    logger.info("正在向 Agent 注入 Retriever...")
     src.agents.nodes._retriever = retriever
     from src.tools.lookup import LookupToolSet
     _lookup_tools = LookupToolSet(retriever)
@@ -209,29 +210,29 @@ def main():
 
     # 3. Load and chunk contract
     docx_path = "data/input/contract.docx"
-    logger.info(f"Loading and chunking {docx_path}...")
+    logger.info(f"正在加载并分块 {docx_path}...")
     if not os.path.exists(docx_path):
         logger.error(f"{docx_path} not found!")
         return
 
     chunks = archivist.extract_chunks(docx_path)
-    logger.info(f"Extracted {len(chunks)} chunks.")
+    logger.info(f"已提取 {len(chunks)} 个块。")
     
     # Generate document structure
-    logger.info("Generating document structure...")
+    logger.info("正在生成文档结构...")
     doc_structure_str = archivist.generate_document_structure(chunks)
-    logger.info("Document structure generated.")
+    logger.info("文档结构生成完毕。")
 
     # 4. Index chunks
-    logger.info("Indexing chunks...")
+    logger.info("正在建立索引...")
     retriever.index_chunks(chunks)
 
     # 5. Build Graph
-    logger.info("Building Workflow Graph...")
+    logger.info("正在构建工作流图...")
     app = create_graph()
 
     # 6. Invoke Graph
-    logger.info("Invoking Graph...")
+    logger.info("正在调用图...")
     # Initial state
     initial_state = {
         "extraction_results": {},
@@ -243,7 +244,25 @@ def main():
     }
     
     # Run the graph
-    final_state = app.invoke(initial_state)
+    # final_state = app.invoke(initial_state)
+    logger.info("正在流式执行图...")
+    final_state = initial_state
+    
+    with tqdm(total=len(task_list), desc="正在处理字段", unit="field") as pbar:
+        # Using stream_mode="values" to get the full state at each step
+        for state in app.stream(initial_state, stream_mode="values"):
+            final_state = state
+            
+            # Update progress based on completed tasks
+            current_results = state.get("extraction_results", {})
+            pbar.n = len(current_results)
+            pbar.refresh()
+            
+            # Update description based on count
+            if pbar.n < len(task_list):
+                 pbar.set_description(f"正在处理字段 ({pbar.n}/{len(task_list)})")
+            else:
+                 pbar.set_description("正在完成...")
 
     # 7. Export results
     results = final_state.get("extraction_results", {})
@@ -255,7 +274,9 @@ def main():
             "Value": res.get("value"),
             "Source Chunk": res.get("source_chunk_id"),
             "Confidence": res.get("confidence"),
-            "Notes": res.get("validation_notes")
+            "Notes": res.get("validation_notes"),
+            "Navigation History": res.get("navigation_history"),
+            "Failure Reason": res.get("failure_reason")
         })
     
     output_df = pd.DataFrame(output_data)
@@ -264,7 +285,7 @@ def main():
     output_csv = os.path.join(output_dir, "result.csv")
     output_df.to_csv(output_csv, index=False)
     
-    logger.info(f"Success! Results exported to {output_csv}")
+    logger.info(f"成功！结果已导出至 {output_csv}")
     print(output_df)
 
 if __name__ == "__main__":

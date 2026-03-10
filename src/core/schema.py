@@ -14,7 +14,9 @@ class ExtractionResult(BaseModel):
     evidence: Optional[str] = Field(description="The quote or evidence from the document", default=None)
     clause_no: Optional[str] = Field(description="The clause number where the value was found", default=None)
     page_number: Optional[int] = Field(description="Page number where the value was found", default=None)
+    navigation_history: Optional[List[str]] = Field(description="History of navigation steps taken to find the value", default=None)
     error: Optional[str] = Field(description="Error message if extraction failed", default=None)
+    failure_reason: Optional[str] = Field(description="Reason for validation failure", default=None)
 
 class SupervisorDecision(BaseModel):
     """
