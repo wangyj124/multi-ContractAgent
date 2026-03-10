@@ -1,0 +1,4 @@
+Task,Value,Source Chunk,Confidence,Notes,Failure Reason,History Steps
+合同金额,1000000,2,0.95,The amount is specified in USD and is clearly stated as the total contract amount. The value is extracted and converted to numeric format.,,2
+签署日期,2023-01-01,4,0.95,The field '签署日期' is successfully extracted from the text. The value '2023-01-01' matches the 'Sign Date' field in the provided chunk.,,2
+付款方式,,3,0.0,Not found,The text provides installment amounts but lacks information on the payment method.,2

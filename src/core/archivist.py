@@ -158,13 +158,13 @@ class Archivist:
         try:
             llm = get_llm("gpt-4o-mini") # Using a lightweight model for summary
             messages = [
-                ("system", "You are a helpful assistant that summarizes legal document chunks."),
-                ("human", f"Summarize the following text concisely within 50 words:\n\n{text[:2000]}")
+                ("system", "你是一个乐于助人的助手，负责总结法律文件块。"),
+                ("human", f"简明扼要地将以下文本总结在50字以内：\n\n{text[:2000]}")
             ]
             response = llm.invoke(messages)
             return response.content
         except Exception as e:
-            return f"Error generating summary: {str(e)}"
+            return f"生成摘要时出错：{str(e)}"
 
     def generate_document_structure(self, chunks: List[Dict[str, Any]]) -> str:
         """

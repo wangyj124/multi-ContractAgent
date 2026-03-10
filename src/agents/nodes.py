@@ -1,4 +1,5 @@
 import json
+import os
 from typing import List, Dict, Any, Literal, Optional
 
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage, HumanMessage
@@ -6,11 +7,16 @@ from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from pathlib import Path
 
-from src.core.state import AgentState
+from src.core.state import AgentState, FieldState
 from src.core.llm import get_llm
 from src.core.schema import ExtractionResult
 from src.tools.lookup import LookupToolSet
 from src.core.retriever import Retriever
+
+class Colors:
+    CYAN = '\033[96m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
 
 def _load_prompt(prompt_name: str) -> str:
     base_path = Path(__file__).parent.parent / "prompts"
@@ -27,31 +33,21 @@ _retriever = Retriever(location=":memory:", collection_name="contract_chunks")
 _lookup_tools = LookupToolSet(_retriever)
 tools = _lookup_tools.get_tools()
 
-def supervisor_node(state: AgentState) -> Dict[str, Any]:
+def field_supervisor_node(state: FieldState) -> Dict[str, Any]:
     """
-    Supervisor node that manages the extraction workflow.
-    It identifies the next task and decides which tool to use to retrieve information.
+    Field Supervisor node that manages the extraction for a SINGLE field.
+    It decides which tool to use to retrieve information for the current_task.
     """
-    extraction_results = state.get("extraction_results", {}) or {}
-    task_list = state.get("task_list", [])
+    current_task = state.get("field_current_task")
     document_structure = state.get("document_structure", "")
     
-    # 1. Identify next missing field
-    next_task = None
-    for task in task_list:
-        if task not in extraction_results:
-            next_task = task
-            break
-            
-    if not next_task:
-        return {"next_step": "finish"}
+    if not current_task:
+        # Should not happen in subgraph context if initialized correctly
+        return {"field_next_step": "finish"}
         
-    # 2. Update state with current task
-    # Note: We return the update, LangGraph merges it
-    
-    # 3. Decide on tool usage
+    # Decide on tool usage
     # We use an LLM to decide which tool to call based on the task
-    llm = get_llm("gpt-4o", temperature=0) # Use a smart model for supervision
+    llm = get_llm(os.environ.get("MODEL_SUPERVISOR", "gpt-4o"), temperature=0) # Use a smart model for supervision
     llm_with_tools = llm.bind_tools(tools)
     
     prompt_text = _load_prompt("supervisor")
@@ -63,33 +59,59 @@ def supervisor_node(state: AgentState) -> Dict[str, Any]:
     chain = prompt | llm_with_tools
     
     # Sliding window for messages
-    messages = state.get("messages", [])
+    messages = state.get("field_messages", [])
     if len(messages) > 3:
         messages = messages[-3:]
     
     response = chain.invoke({
-        "task": next_task, 
+        "task": current_task, 
         "document_structure": document_structure,
         "messages": messages
     })
     
+    navigation_history = state.get("navigation_history", []) or []
+
+    if response.content:
+        # If there is content, print it as thinking process
+        print(f"{Colors.CYAN}[思考中] {response.content}{Colors.RESET}")
+
+    if response.tool_calls:
+        next_step = "tools"
+        for tool_call in response.tool_calls:
+            decision_msg = f"调用工具: {tool_call['name']} 参数 {tool_call['args']}"
+            print(f"{Colors.CYAN}[决策] {decision_msg}{Colors.RESET}")
+            navigation_history.append(decision_msg)
+    else:
+        next_step = "worker"
+    
     return {
-        "next_step": "tools",
-        "current_task": next_task,
-        "messages": [response]
+        "field_next_step": next_step,
+        "field_messages": [response],
+        "navigation_history": navigation_history
     }
 
-def worker_node(state: AgentState) -> Dict[str, Any]:
+def worker_node(state: FieldState) -> Dict[str, Any]:
     """
     Worker node that extracts information from the retrieved text.
     """
-    current_task = state.get("current_task")
-    messages = state.get("messages", [])
+    current_task = state.get("field_current_task")
+    messages = state.get("field_messages", [])
     
     # Find the last ToolMessage which contains the retrieved text
     # Or just the last message if it's from the tool
     # In LangGraph with ToolNode, the last message should be a ToolMessage
     
+    # Build navigation history
+    navigation_history = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                 navigation_history.append(f"工具调用: {tool_call['name']} ({tool_call['args']})")
+        elif isinstance(msg, ToolMessage):
+             # Truncate output to avoid huge history
+             content_preview = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+             navigation_history.append(f"工具输出: {content_preview}")
+
     # We look for the most recent ToolMessage
     tool_output = ""
     for msg in reversed(messages):
@@ -102,7 +124,7 @@ def worker_node(state: AgentState) -> Dict[str, Any]:
         tool_output = "No information found."
 
     # Use Qwen for extraction as requested
-    llm = get_llm("qwen3-30B-A3B-Instruct", temperature=0)
+    llm = get_llm(os.environ.get("MODEL_WORKER", "qwen3-30B-A3B-Instruct"), temperature=0)
     
     # We want structured output
     structured_llm = llm.with_structured_output(ExtractionResult)
@@ -122,36 +144,32 @@ def worker_node(state: AgentState) -> Dict[str, Any]:
             error=str(e),
             confidence=0.0
         )
+    
+    # Add navigation history to result
+    result.navigation_history = navigation_history
         
     # Update extraction results
-    # We need to handle the dict update carefully
-    # LangGraph merges top-level keys. For dictionaries, it usually replaces them unless a reducer is defined.
-    # In AgentState, extraction_results is just a Dict. We should fetch existing, update, and return.
-    # Actually, AgentState definition in state.py uses `Dict[str, Any]`.
-    # To merge, we usually define a reducer in Annotated, but here we can just read and update.
-    # However, if we return `{"extraction_results": new_dict}`, it might overwrite.
-    # But since we are inside the node, we have the full state.
-    
     current_results = state.get("extraction_results", {}).copy()
     current_results[current_task] = result.model_dump()
     
     return {
         "extraction_results": current_results,
-        "next_step": "validator" # Go to validator next
+        "field_next_step": "validator", # Go to validator next
+        "navigation_history": navigation_history
     }
 
-def validator_node(state: AgentState) -> Dict[str, Any]:
+def validator_node(state: FieldState) -> Dict[str, Any]:
     """
     Validator node that checks the extraction result.
     """
-    current_task = state.get("current_task")
+    current_task = state.get("field_current_task")
     extraction_results = state.get("extraction_results", {})
     
     result_data = extraction_results.get(current_task)
     
     if not result_data:
         # Should not happen
-        return {"next_step": "supervisor"}
+        return {"field_next_step": "field_supervisor"}
         
     value = result_data.get("value")
     chunk_id = result_data.get("source_chunk_id")
@@ -163,16 +181,25 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
         cleaned_value = value.strip()
         if cleaned_value == "___" or cleaned_value == "" or all(c == '_' for c in cleaned_value):
             result_data["value"] = None
-            notes.append("Marked as Original Empty due to placeholder.")
+            notes.append("因占位符标记为原空。")
             
             # Fetch context to see if we can find real value?
             if chunk_id is not None:
                 # Just trigger context retrieval as requested
                 _retriever.get_context(chunk_id, window=1)
-                notes.append(f"Context retrieved for empty value from chunk {chunk_id}.")
+                notes.append(f"为填充空值检索上下文，来自块 {chunk_id}。")
 
     # 2. Date Order Logic
     # Check if "Sign Date" and "Effective Date" exist
+    # NOTE: In parallel execution, we might not have access to other fields yet if they are being processed concurrently!
+    # Validation relying on other fields (like Sign Date vs Effective Date) might fail or need to be done in Aggregator?
+    # Or we just validate what we have. If Sign Date is missing in local state, we skip this check.
+    # In FieldState, extraction_results only has the current task result usually, unless we pass in global results?
+    # If we pass in global results in the Send payload, we can check.
+    # But other fields might be in progress.
+    # So cross-field validation is better done in Aggregator or a final Validator node in the main graph.
+    # For now, we'll keep the logic but it might not trigger if data is missing.
+    
     if current_task == "Effective Date" and "Sign Date" in extraction_results:
         sign_date_res = extraction_results["Sign Date"]
         sign_date = sign_date_res.get("value")
@@ -181,14 +208,12 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
         # Only compare if both are strings (simple comparison)
         if isinstance(sign_date, str) and isinstance(effective_date, str):
             if effective_date < sign_date:
-                notes.append(f"Warning: Effective Date ({effective_date}) is before Sign Date ({sign_date}).")
+                notes.append(f"警告：生效日期 ({effective_date}) 早于签署日期 ({sign_date})。")
                 if chunk_id is not None:
                     _retriever.get_context(chunk_id)
-                    notes.append(f"Context retrieved due to date mismatch from chunk {chunk_id}.")
+                    notes.append(f"因日期不匹配检索上下文，来自块 {chunk_id}。")
 
     # 3. Amount Conservation Logic
-    # Check "Total Amount" vs "Installment Amounts"
-    # Assuming "Installment Amounts" is a list of numbers or strings
     if current_task == "Total Amount" and "Installment Amounts" in extraction_results:
         installments_res = extraction_results["Installment Amounts"]
         installments = installments_res.get("value")
@@ -199,10 +224,10 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
                 # Sum installments (handling strings or numbers)
                 inst_sum = sum(float(x) for x in installments if x is not None)
                 if abs(inst_sum - float(total_amount)) > 0.01: # float epsilon
-                    notes.append(f"Warning: Sum of installments ({inst_sum}) does not match Total Amount ({total_amount}).")
+                    notes.append(f"警告：分期总和 ({inst_sum}) 与总金额 ({total_amount}) 不匹配。")
                     if chunk_id is not None:
                         _retriever.get_context(chunk_id)
-                        notes.append(f"Context retrieved due to amount mismatch from chunk {chunk_id}.")
+                        notes.append(f"因金额不匹配检索上下文，来自块 {chunk_id}。")
             except ValueError:
                 pass # Could not parse numbers
 
@@ -211,8 +236,19 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
         existing_notes = result_data.get("validation_notes")
         if existing_notes:
             notes.insert(0, existing_notes)
-        result_data["validation_notes"] = "; ".join(notes)
+        notes_str = "; ".join(notes)
+        result_data["validation_notes"] = notes_str
         
+        # Determine failure type and print log
+        failure_type = "GENERAL_ERROR"
+        if result_data.get("value") is None:
+             failure_type = "MISSING_CONTENT"
+        elif "日期不匹配" in notes_str or "金额不匹配" in notes_str or "分期总和" in notes_str:
+             failure_type = "LOGIC_ERROR"
+        
+        print(f"{Colors.RED}[验证失败] 类型: {failure_type}, 原因: {notes_str}{Colors.RESET}")
+        result_data["failure_reason"] = f"{failure_type}: {notes_str}"
+
     # Update state with modified result
     extraction_results[current_task] = result_data
     
@@ -223,16 +259,40 @@ def validator_node(state: AgentState) -> Dict[str, Any]:
             del extraction_results[current_task]
             
         feedback_msg = HumanMessage(
-            content=f"Validation Failed for task '{current_task}': {'; '.join(notes)}. Please try to find the correct information again.",
+            content=f"任务验证失败 '{current_task}': {notes_str}。请尝试再次查找正确信息。",
             name="validator"
         )
         return {
             "extraction_results": extraction_results,
-            "next_step": "supervisor",
-            "messages": [feedback_msg]
+            "field_next_step": "field_supervisor",
+            "field_messages": [feedback_msg]
         }
         
     return {
         "extraction_results": extraction_results,
-        "next_step": "supervisor"
+        "field_next_step": "finish" # Success
     }
+
+def dispatcher_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Dispatcher node that selects a batch of tasks to process in parallel.
+    """
+    extraction_results = state.get("extraction_results", {})
+    task_list = state.get("task_list", [])
+    
+    # Identify pending tasks
+    pending_tasks = [task for task in task_list if task not in extraction_results]
+    
+    if not pending_tasks:
+        return {"next_step": "end"}
+        
+    # We return dispatch to signal the router to send tasks
+    return {"next_step": "dispatch"}
+
+def aggregator_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Aggregator node that synchronizes parallel branches.
+    Since AgentState uses a reducer for extraction_results, the data is already merged.
+    This node serves as a check point and loops back to dispatcher.
+    """
+    return {"next_step": "dispatcher"}

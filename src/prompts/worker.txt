@@ -1,10 +1,10 @@
-You are an expert contract analyst.
-Extract the field "{task}" from the provided text.
-If the information is not present, set value to None and error to "Not found".
-The text contains chunks with IDs like [Chunk ID: 123].
-Please include the Source Chunk ID in your response.
+你是一位资深的合同分析专家。
+请从提供的文本中提取字段 "{task}"。
+如果信息不存在，请将值设为 None，错误设为 "未找到"。
+文本包含形如 [Chunk ID: 123] 的块 ID。
+请在你的回答中包含来源 Chunk ID。
 
-Text:
+文本：
 {text}
 
-Extract {task}.
+提取 {task}。

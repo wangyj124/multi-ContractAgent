@@ -20,12 +20,12 @@ class LookupToolSet:
             
         llm = get_llm("qwen3-30B-A3B-Instruct")
         try:
-            summary_response = llm.invoke(f"Summarize the following text into 150 words:\n\n{text}")
+            summary_response = llm.invoke(f"将以下文本总结为150字：\n\n{text}")
             summary = summary_response.content
-            return f"{summary}\n\n[Note: This is a summary of the retrieved text due to length limit]"
+            return f"{summary}\n\n[注意：由于长度限制，这是检索文本的摘要]"
         except Exception as e:
             # Fallback to original text or truncated version if LLM fails
-            return text[:2000] + "\n\n[Note: Text truncated due to length and summarization failure]"
+            return text[:2000] + "\n\n[注意：由于长度和总结失败，文本已被截断]"
 
     def _rerank_results(self, query: str, results: List[Dict]) -> List[Dict]:
         """
@@ -48,9 +48,9 @@ class LookupToolSet:
             Document Chunk:
             {content[:1000]}
             
-            Task: Rate the relevance of the document chunk to the query on a scale of 0 to 10.
-            0 means completely irrelevant, 10 means perfect match.
-            Return ONLY the number.
+            Task: 请对文档块与查询的相关性进行评分，范围从0到10。
+            0表示完全不相关，10表示完全匹配。
+            仅返回数字。
             """
             
             try:
@@ -79,7 +79,7 @@ class LookupToolSet:
         Generate a concise report of the search results using LLM.
         """
         if not results:
-            return "No relevant results found after reranking."
+            return "重排序后未找到相关结果。"
             
         llm = get_llm("qwen3-30B-A3B-Instruct")
         
@@ -93,8 +93,8 @@ class LookupToolSet:
             
         prompt = f"""
         Here are some search results found for a user query.
-        Summarize these results into a concise report.
-        Format: "Found X relevant chunks: \\n- [Chunk ID] Summary..."
+        将这些结果总结为一份简明的报告。
+        格式：“找到 X 个相关块：\\n- [Chunk ID] 摘要...”
         
         Search Results:
         {candidates_text}
@@ -104,7 +104,7 @@ class LookupToolSet:
             response = llm.invoke(prompt)
             return response.content
         except Exception as e:
-            return "Error generating report."
+            return "生成报告时出错。"
 
     def structural_lookup(self, path: str) -> str:
         """
@@ -116,7 +116,7 @@ class LookupToolSet:
         results = self.retriever.search_by_path(path)
         
         if not results:
-            return f"No content found for path: {path}"
+            return f"未找到路径的内容：{path}"
         
         # Combine content from chunks
         # Use "text" or "content" field
@@ -157,12 +157,12 @@ class LookupToolSet:
         results = self.retriever.search(query, k=10, filter=qdrant_filter)
         
         if not results:
-            return "No relevant content found."
+            return "未找到相关内容。"
             
         reranked = self._rerank_results(query, results)
         
         if not reranked:
-            return "No relevant content found after reranking."
+            return "重排序后未找到相关内容。"
             
         if len(reranked) == 1:
             res = reranked[0]
@@ -204,7 +204,7 @@ class LookupToolSet:
                 paths.add(p)
                 
         if not paths:
-            return "No paths found."
+            return "未找到路径。"
             
         return "\n".join(sorted(list(paths)))
 
@@ -216,7 +216,7 @@ class LookupToolSet:
         results = self.retriever.get_context(chunk_id, window=1)
         
         if not results:
-            return f"No context found for chunk_id: {chunk_id}"
+            return f"未找到块ID的上下文：{chunk_id}"
             
         contents = []
         for res in results:
