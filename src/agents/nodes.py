@@ -17,6 +17,8 @@ class Colors:
     CYAN = '\033[96m'
     RED = '\033[91m'
     RESET = '\033[0m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
 
 def _load_prompt(prompt_name: str) -> str:
     base_path = Path(__file__).parent.parent / "prompts"
@@ -44,6 +46,47 @@ def field_supervisor_node(state: FieldState) -> Dict[str, Any]:
     if not current_task:
         # Should not happen in subgraph context if initialized correctly
         return {"field_next_step": "finish"}
+
+    # Check if we just came from tools
+    # If the last message is a ToolMessage, it means tools just executed.
+    messages = state.get("field_messages", [])
+    if messages and isinstance(messages[-1], ToolMessage):
+        last_tool_output = messages[-1].content
+        
+        # Check if tool execution was successful (found something)
+        # If tool returned "not found" or similar, we should let Supervisor THINK again to retry with another tool
+        # instead of passing empty/error text to Worker.
+        # Common failure patterns from src/tools/lookup.py:
+        # "未找到路径..."
+        # "未找到相关内容..."
+        # "重排序后未找到..."
+        
+        failure_keywords = ["未找到", "No information found", "无法获取内容"]
+        is_tool_failure = any(k in last_tool_output for k in failure_keywords) and len(last_tool_output) < 200
+        
+        # New check for Navigation_Reflector output (usually just a list of paths)
+        # If the output looks like a path or list of paths, and NOT full content, we should continue thinking.
+        # Heuristic: Check if the last tool called was Navigation_Reflector
+        is_navigation_output = False
+        if len(messages) >= 2:
+             # Find the last AIMessage that initiated this tool call
+             # messages list: [... AIMessage(tool_calls), ToolMessage(content)]
+             prev_msg = messages[-2]
+             if isinstance(prev_msg, AIMessage) and prev_msg.tool_calls:
+                 # Check all tool calls in the last message
+                 for tc in prev_msg.tool_calls:
+                     if tc['name'] == "Navigation_Reflector":
+                         is_navigation_output = True
+                         break
+        
+        if not is_tool_failure and not is_navigation_output:
+            print(f"{Colors.CYAN}[Field Supervisor] 决策: 工具执行完毕且有内容，转交 Worker 进行提取{Colors.RESET}")
+            return {"field_next_step": "worker"}
+        elif is_navigation_output:
+             print(f"{Colors.CYAN}[Field Supervisor] 决策: 收到路径列表，继续思考以获取具体内容{Colors.RESET}")
+        else:
+            print(f"{Colors.CYAN}[Field Supervisor] 决策: 工具未找到有效内容，继续思考重试策略{Colors.RESET}")
+            # Fall through to LLM logic below
         
     # Decide on tool usage
     # We use an LLM to decide which tool to call based on the task
@@ -73,22 +116,27 @@ def field_supervisor_node(state: FieldState) -> Dict[str, Any]:
 
     if response.content:
         # If there is content, print it as thinking process
-        print(f"{Colors.CYAN}[思考中] {response.content}{Colors.RESET}")
+        print(f"{Colors.CYAN}[Field Supervisor] 思考: {response.content}{Colors.RESET}")
 
     if response.tool_calls:
         next_step = "tools"
         for tool_call in response.tool_calls:
-            decision_msg = f"调用工具: {tool_call['name']} 参数 {tool_call['args']}"
-            print(f"{Colors.CYAN}[决策] {decision_msg}{Colors.RESET}")
+            decision_msg = f"工具调用: {tool_call['name']} ({tool_call['args']})"
+            print(f"{Colors.CYAN}[Field Supervisor] 决策: {decision_msg}{Colors.RESET}")
             navigation_history.append(decision_msg)
     else:
+        # If no tool calls, it means the supervisor thinks we have enough info or can't find anything.
+        # In this case, we should pass to worker to attempt extraction or report "not found".
         next_step = "worker"
+        print(f"{Colors.CYAN}[Field Supervisor] 决策: 无需更多工具，转交 Worker{Colors.RESET}")
     
     return {
         "field_next_step": next_step,
         "field_messages": [response],
         "navigation_history": navigation_history
     }
+
+from langchain_core.output_parsers import JsonOutputParser
 
 def worker_node(state: FieldState) -> Dict[str, Any]:
     """
@@ -117,40 +165,73 @@ def worker_node(state: FieldState) -> Dict[str, Any]:
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage):
             tool_output = msg.content
+            print(f"{Colors.BLUE}[Worker] 收到工具输出: {tool_output[:200]}...{Colors.RESET}")
             break
             
     if not tool_output:
         # Fallback if no tool output found (should not happen in normal flow)
         tool_output = "No information found."
+        print(f"{Colors.YELLOW}[Worker] 未检测到工具输出，使用默认值。{Colors.RESET}")
 
     # Use Qwen for extraction as requested
     llm = get_llm(os.environ.get("MODEL_WORKER", "qwen3-30B-A3B-Instruct"), temperature=0)
     
     # We want structured output
-    structured_llm = llm.with_structured_output(ExtractionResult)
+    # Since Qwen might have issues with with_structured_output in some environments,
+    # we use JsonOutputParser which is more robust.
+    parser = JsonOutputParser(pydantic_object=ExtractionResult)
     
+    # Load prompt and append format instructions
     prompt_text = _load_prompt("worker")
+    prompt_text += "\n请严格按照以下JSON格式输出结果，不要包含任何Markdown标记或其他文本：\n{format_instructions}\n"
+    
     prompt = ChatPromptTemplate.from_template(prompt_text)
     
-    chain = prompt | structured_llm
+    chain = prompt | llm | parser
     
     try:
-        result: ExtractionResult = chain.invoke({"task": current_task, "text": tool_output})
+        result_dict = chain.invoke({
+            "task": current_task, 
+            "text": tool_output,
+            "format_instructions": parser.get_format_instructions()
+        })
+        
+        # FIX for "Present but Empty" vs "Not Found"
+        # If the tool found the path but it's empty (e.g., "1.1 签署日期：__________")
+        # the LLM might return None. We need to preserve the source_chunk_id so Validator knows it exists.
+        # If result_dict["value"] is None but there's a valid source_snippet, it means it was found but empty.
+        
+        # We need to extract the chunk_id from tool_output if LLM failed to do so
+        if result_dict.get("source_chunk_id") is None and "[Chunk ID:" in tool_output:
+            import re
+            match = re.search(r'\[Chunk ID:\s*(\d+)\]', tool_output)
+            if match:
+                result_dict["source_chunk_id"] = match.group(1)
+
+        # Ensure default fields
+        if "confidence" not in result_dict:
+            result_dict["confidence"] = 1.0
+            
+        print(f"{Colors.BLUE}[Worker] 提取结果: {json.dumps(result_dict, ensure_ascii=False, indent=2)}{Colors.RESET}")
+        
     except Exception as e:
+        print(f"{Colors.RED}[Worker] 提取失败: {e}{Colors.RESET}")
         # Handle parsing errors or LLM errors
-        result = ExtractionResult(
-            field_name=current_task,
-            value=None,
-            error=str(e),
-            confidence=0.0
-        )
+        result_dict = {
+            "field_name": current_task,
+            "value": None,
+            "error": str(e),
+            "confidence": 0.0,
+            "validation_notes": None,
+            "failure_reason": "Extraction Error"
+        }
     
     # Add navigation history to result
-    result.navigation_history = navigation_history
+    result_dict["navigation_history"] = navigation_history
         
     # Update extraction results
     current_results = state.get("extraction_results", {}).copy()
-    current_results[current_task] = result.model_dump()
+    current_results[current_task] = result_dict
     
     return {
         "extraction_results": current_results,
@@ -160,7 +241,7 @@ def worker_node(state: FieldState) -> Dict[str, Any]:
 
 def validator_node(state: FieldState) -> Dict[str, Any]:
     """
-    Validator node that checks the extraction result.
+    Validator node that checks the extraction result using LLM.
     """
     current_task = state.get("field_current_task")
     extraction_results = state.get("extraction_results", {})
@@ -173,64 +254,99 @@ def validator_node(state: FieldState) -> Dict[str, Any]:
         
     value = result_data.get("value")
     chunk_id = result_data.get("source_chunk_id")
+    
+    # Context Expansion Logic
+    context_text = "无上下文"
+    if chunk_id:
+        try:
+            # Retrieve specific chunk
+            chunk_data = _retriever.get_chunk(int(chunk_id))
+            if chunk_data:
+                # Get path
+                # Metadata might be flattened or in metadata dict depending on how it was indexed
+                path = chunk_data.get("path") or chunk_data.get("metadata", {}).get("path")
+                
+                if path:
+                    # Expand to parent scope (e.g. "Chapter 2/2.2" -> "Chapter 2")
+                    parts = path.split('/')
+                    if len(parts) > 1:
+                        parent_path = "/".join(parts[:-1])
+                        # Retrieve all chunks in parent scope
+                        # Note: search_by_path returns list of dicts (payloads)
+                        related_chunks = _retriever.search_by_path(parent_path)
+                        
+                        # Sort by chunk_id to maintain document order
+                        # Ensure chunk_id exists and is sortable
+                        related_chunks.sort(key=lambda x: int(x.get('chunk_id', 0)))
+                        
+                        # Concatenate content
+                        texts = []
+                        for c in related_chunks:
+                            c_text = c.get('content') or c.get('text')
+                            if c_text:
+                                texts.append(c_text)
+                        
+                        if texts:
+                            context_text = "\n---\n".join(texts)
+                            print(f"{Colors.CYAN}[验证器] 上下文扩展成功: {parent_path} (包含 {len(texts)} 个块){Colors.RESET}")
+                        else:
+                             context_text = chunk_data.get('content') or chunk_data.get('text') or "无法获取内容"
+                    else:
+                        # Top level, just use chunk content
+                        context_text = chunk_data.get('content') or chunk_data.get('text') or "无法获取内容"
+                else:
+                     context_text = chunk_data.get('content') or chunk_data.get('text') or "无法获取内容"
+        except Exception as e:
+            print(f"{Colors.RED}[验证器] 获取上下文失败: {e}{Colors.RESET}")
+
+    # Use LLM for validation
+    llm = get_llm(os.environ.get("MODEL_VALIDATOR", "qwen3-30B-A3B-Instruct"), temperature=0)
+    
+    prompt_text = _load_prompt("validator")
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+    
+    chain = prompt | llm
+    
+    try:
+        validation_response = chain.invoke({
+            "task": current_task,
+            "value": str(value),
+            "chunk_id": str(chunk_id) if chunk_id else "Unknown",
+            "context": context_text
+        })
+        content = validation_response.content
+        print(f"{Colors.CYAN}[验证器] 模型分析: {content}{Colors.RESET}")
+    except Exception as e:
+        content = f"验证过程出错: {str(e)}"
+
+    # Parse LLM response for issues (heuristic)
     notes = []
     
-    # 1. Null Value Logic
-    # Check for "___" or empty string or similar placeholders
-    if isinstance(value, str):
-        cleaned_value = value.strip()
-        if cleaned_value == "___" or cleaned_value == "" or all(c == '_' for c in cleaned_value):
-            result_data["value"] = None
-            notes.append("因占位符标记为原空。")
-            
-            # Fetch context to see if we can find real value?
-            if chunk_id is not None:
-                # Just trigger context retrieval as requested
-                _retriever.get_context(chunk_id, window=1)
-                notes.append(f"为填充空值检索上下文，来自块 {chunk_id}。")
-
-    # 2. Date Order Logic
-    # Check if "Sign Date" and "Effective Date" exist
-    # NOTE: In parallel execution, we might not have access to other fields yet if they are being processed concurrently!
-    # Validation relying on other fields (like Sign Date vs Effective Date) might fail or need to be done in Aggregator?
-    # Or we just validate what we have. If Sign Date is missing in local state, we skip this check.
-    # In FieldState, extraction_results only has the current task result usually, unless we pass in global results?
-    # If we pass in global results in the Send payload, we can check.
-    # But other fields might be in progress.
-    # So cross-field validation is better done in Aggregator or a final Validator node in the main graph.
-    # For now, we'll keep the logic but it might not trigger if data is missing.
+    # 2. Extract validity from LLM response
+    # It must contain either "验证通过（Valid）" or "验证失败（Invalid）" based on prompt
+    is_valid = "验证通过" in content or "Valid" in content
+    is_invalid = "验证失败" in content or "Invalid" in content
     
-    if current_task == "Effective Date" and "Sign Date" in extraction_results:
-        sign_date_res = extraction_results["Sign Date"]
-        sign_date = sign_date_res.get("value")
-        effective_date = result_data.get("value")
+    # Check specifically for "正确地未找到" or "留空" which should be Valid
+    is_confirmed_missing_or_empty = "正确地未找到" in content or "留空" in content or "未填写" in content
+    
+    # Conflict resolution: Trust the explicit marker first
+    if "**验证通过（Valid）**" in content or "**通过（Valid）**" in content:
+        is_valid = True
+        is_invalid = False
+    elif "**验证失败（Invalid）**" in content or "**失败（Invalid）**" in content:
+        is_invalid = True
+        is_valid = False
         
-        # Only compare if both are strings (simple comparison)
-        if isinstance(sign_date, str) and isinstance(effective_date, str):
-            if effective_date < sign_date:
-                notes.append(f"警告：生效日期 ({effective_date}) 早于签署日期 ({sign_date})。")
-                if chunk_id is not None:
-                    _retriever.get_context(chunk_id)
-                    notes.append(f"因日期不匹配检索上下文，来自块 {chunk_id}。")
-
-    # 3. Amount Conservation Logic
-    if current_task == "Total Amount" and "Installment Amounts" in extraction_results:
-        installments_res = extraction_results["Installment Amounts"]
-        installments = installments_res.get("value")
-        total_amount = result_data.get("value")
+    if is_valid and not is_invalid:
+        pass # Success
+    elif is_confirmed_missing_or_empty:
+        pass # Success (Empty but valid)
+    else:
+        # Likely failed
+        notes.append(content)
+        print(f"{Colors.RED}[验证失败] {content[:200]}...{Colors.RESET}")
         
-        if isinstance(installments, list) and (isinstance(total_amount, int) or isinstance(total_amount, float)):
-            try:
-                # Sum installments (handling strings or numbers)
-                inst_sum = sum(float(x) for x in installments if x is not None)
-                if abs(inst_sum - float(total_amount)) > 0.01: # float epsilon
-                    notes.append(f"警告：分期总和 ({inst_sum}) 与总金额 ({total_amount}) 不匹配。")
-                    if chunk_id is not None:
-                        _retriever.get_context(chunk_id)
-                        notes.append(f"因金额不匹配检索上下文，来自块 {chunk_id}。")
-            except ValueError:
-                pass # Could not parse numbers
-
     # Update result with notes
     if notes:
         existing_notes = result_data.get("validation_notes")
@@ -239,14 +355,8 @@ def validator_node(state: FieldState) -> Dict[str, Any]:
         notes_str = "; ".join(notes)
         result_data["validation_notes"] = notes_str
         
-        # Determine failure type and print log
-        failure_type = "GENERAL_ERROR"
-        if result_data.get("value") is None:
-             failure_type = "MISSING_CONTENT"
-        elif "日期不匹配" in notes_str or "金额不匹配" in notes_str or "分期总和" in notes_str:
-             failure_type = "LOGIC_ERROR"
-        
-        print(f"{Colors.RED}[验证失败] 类型: {failure_type}, 原因: {notes_str}{Colors.RESET}")
+        # Determine failure type
+        failure_type = "VALIDATION_ERROR"
         result_data["failure_reason"] = f"{failure_type}: {notes_str}"
 
     # Update state with modified result
@@ -254,6 +364,33 @@ def validator_node(state: FieldState) -> Dict[str, Any]:
     
     # If validation failed (notes added), create feedback message and force retry
     if notes:
+        # Check max retries
+        current_retries = state.get("validation_retries", 0)
+        MAX_RETRIES = 3
+        
+        if current_retries >= MAX_RETRIES:
+            print(f"{Colors.RED}[验证器] 超过最大重试次数 ({MAX_RETRIES})，放弃任务: {current_task}{Colors.RESET}")
+            # Mark as failed but finished
+            result_data["failure_reason"] = f"MAX_RETRIES_EXCEEDED: {notes_str}"
+            extraction_results[current_task] = result_data
+            return {
+                "extraction_results": extraction_results,
+                "field_next_step": "finish"
+            }
+            
+        # Check if the failure is actually a valid "Not Found" case
+        # Loose check for "Valid" or "通过" to handle LLM variations
+        is_confirmed_missing = any("通过" in content or "Valid" in content or "确实未提及" in content for content in notes)
+        
+        if is_confirmed_missing:
+             # It's actually a success
+             result_data["validation_notes"] = None # Clear notes
+             extraction_results[current_task] = result_data
+             return {
+                "extraction_results": extraction_results,
+                "field_next_step": "finish"
+             }
+        
         # We remove the task from extraction_results so supervisor sees it as missing and retries
         if current_task in extraction_results:
             del extraction_results[current_task]
@@ -262,10 +399,14 @@ def validator_node(state: FieldState) -> Dict[str, Any]:
             content=f"任务验证失败 '{current_task}': {notes_str}。请尝试再次查找正确信息。",
             name="validator"
         )
+        
+        # When retrying, we go back to supervisor. 
+        # Supervisor will see the feedback message and decide on new tool calls.
         return {
             "extraction_results": extraction_results,
             "field_next_step": "field_supervisor",
-            "field_messages": [feedback_msg]
+            "field_messages": [feedback_msg],
+            "validation_retries": current_retries + 1
         }
         
     return {

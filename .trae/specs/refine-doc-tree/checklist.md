@@ -1,0 +1,5 @@
+- [ ] Document tree explicitly shows "Chapter" (e.g., "第四章") nodes.
+- [ ] Document tree does NOT show nodes deeper than "4.1" (e.g., "4.1.1" is hidden or aggregated).
+- [ ] Summaries in the tree are concise (< 100 words) and do NOT repeat the node title.
+- [ ] Text < 50 chars is NOT sent to LLM for summarization.
+- [ ] Validator node uses the new `validator.txt` prompt.

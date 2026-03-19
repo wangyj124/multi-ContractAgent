@@ -1,0 +1,8 @@
+Query: {query}
+
+Document Chunk:
+{content}
+
+Task: 请对文档块与查询的相关性进行评分，范围从0到10。
+0表示完全不相关，10表示完全匹配。
+仅返回数字。

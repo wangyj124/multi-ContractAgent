@@ -1,0 +1,5 @@
+- [ ] The script `tests/debug_doc_structure.py` exists and runs successfully.
+- [ ] The output shows the document tree structure.
+- [ ] The output confirms the presence of "第四章" (or similar headers).
+- [ ] The output confirms the absence of nodes deeper than "4.1" (e.g., "4.1.1").
+- [ ] The output confirms summaries are concise (<100 words) and do not repeat the title.

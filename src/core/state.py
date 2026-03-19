@@ -56,3 +56,4 @@ class FieldState(TypedDict):
     field_next_step: str
     field_task_status: str
     navigation_history: List[str]
+    validation_retries: int # Track retries

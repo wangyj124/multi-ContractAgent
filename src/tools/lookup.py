@@ -1,4 +1,6 @@
+import os
 from typing import List, Optional, Set, Union, Dict
+from pathlib import Path
 from langchain_core.tools import StructuredTool
 from src.core.retriever import Retriever
 from src.core.llm import get_llm
@@ -6,6 +8,21 @@ try:
     from qdrant_client.http import models
 except ImportError:
     models = None # Handle gracefully if needed, but Retriever ensures it's there
+
+def _load_prompt(prompt_name: str) -> str:
+    base_path = Path(__file__).parent.parent / "prompts"
+    prompt_path = base_path / f"{prompt_name}.txt"
+    if not prompt_path.exists():
+         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+class Colors:
+    CYAN = '\033[96m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
 
 class LookupToolSet:
     def __init__(self, retriever: Retriever):
@@ -15,12 +32,20 @@ class LookupToolSet:
         """
         Check if text length > 2000. If so, summarize it using LLM.
         """
+        # Configurable summary via env var
+        enable_summary = os.environ.get("ENABLE_LOOKUP_SUMMARY", "false").lower() == "true"
+        
+        if not enable_summary:
+            return text
+            
         if len(text) <= 2000:
             return text
             
         llm = get_llm("qwen3-30B-A3B-Instruct")
         try:
-            summary_response = llm.invoke(f"将以下文本总结为150字：\n\n{text}")
+            prompt_template = _load_prompt("lookup_summary")
+            prompt = prompt_template.format(text=text)
+            summary_response = llm.invoke(prompt)
             summary = summary_response.content
             return f"{summary}\n\n[注意：由于长度限制，这是检索文本的摘要]"
         except Exception as e:
@@ -42,16 +67,8 @@ class LookupToolSet:
             if not content:
                 continue
                 
-            prompt = f"""
-            Query: {query}
-            
-            Document Chunk:
-            {content[:1000]}
-            
-            Task: 请对文档块与查询的相关性进行评分，范围从0到10。
-            0表示完全不相关，10表示完全匹配。
-            仅返回数字。
-            """
+            prompt_template = _load_prompt("lookup_rerank")
+            prompt = prompt_template.format(query=query, content=content[:1000])
             
             try:
                 response = llm.invoke(prompt)
@@ -91,14 +108,8 @@ class LookupToolSet:
             score = res.get('rerank_score', 0)
             candidates_text += f"[Chunk ID: {chunk_id}] (Score: {score})\n{content[:500]}...\n\n"
             
-        prompt = f"""
-        Here are some search results found for a user query.
-        将这些结果总结为一份简明的报告。
-        格式：“找到 X 个相关块：\\n- [Chunk ID] 摘要...”
-        
-        Search Results:
-        {candidates_text}
-        """
+        prompt_template = _load_prompt("lookup_report")
+        prompt = prompt_template.format(candidates_text=candidates_text)
         
         try:
             response = llm.invoke(prompt)
@@ -112,10 +123,29 @@ class LookupToolSet:
         Uses a global or passed-in Retriever instance to find chunks with that path prefix.
         Returns the content of matching chunks combined.
         """
+        print(f"{Colors.YELLOW}[工具] 执行 structural_lookup(path='{path}'){Colors.RESET}")
         # Search by path prefix
         results = self.retriever.search_by_path(path)
         
         if not results:
+            # Try to find a suggestion using the last part of the path
+            parts = path.split('/')
+            if len(parts) > 1:
+                target = parts[-1]
+                # Search for the target keyword in paths
+                # We use a simple semantic search for the target term, expecting it to appear in the path
+                suggestion_results = self.retriever.search(target, k=3)
+                suggestions = []
+                for res in suggestion_results:
+                    p = res.get("payload", {}).get("path", "")
+                    if target in p and p != path:
+                        suggestions.append(p)
+                
+                if suggestions:
+                    # Deduplicate and limit
+                    suggestions = list(set(suggestions))[:3]
+                    return f"未找到路径 '{path}' 的内容。你是不是指：{', '.join(suggestions)}？"
+
             return f"未找到路径的内容：{path}"
         
         # Combine content from chunks
@@ -131,7 +161,9 @@ class LookupToolSet:
                     contents.append(content)
                 
         combined_text = "\n\n".join(contents)
-        return self._summarize_if_needed(combined_text)
+        result = self._summarize_if_needed(combined_text)
+        print(f"{Colors.YELLOW}[工具] 返回内容长度: {len(result)} 字符{Colors.RESET}")
+        return result
 
     def semantic_fallback(self, query: str, path_filter: Optional[str] = None) -> str:
         """
@@ -140,6 +172,7 @@ class LookupToolSet:
         If path_filter is provided, only chunks matching the path (prefix or keyword) are returned.
         Returns the content of top-k chunks combined.
         """
+        print(f"{Colors.YELLOW}[工具] 执行 semantic_fallback(query='{query}', path_filter='{path_filter}'){Colors.RESET}")
         # Search semantically
         qdrant_filter = None
         if path_filter and models:
@@ -170,9 +203,13 @@ class LookupToolSet:
             content = payload.get("text") or payload.get("content") or ""
             chunk_id = res.get("id") or payload.get("chunk_id")
             result_text = f"[Chunk ID: {chunk_id}]\n{content}"
-            return self._summarize_if_needed(result_text)
+            final_res = self._summarize_if_needed(result_text)
+            print(f"{Colors.YELLOW}[工具] 返回单条结果长度: {len(final_res)} 字符{Colors.RESET}")
+            return final_res
             
-        return self._generate_search_report(reranked)
+        report = self._generate_search_report(reranked)
+        print(f"{Colors.YELLOW}[工具] 返回搜索报告长度: {len(report)} 字符{Colors.RESET}")
+        return report
 
     def Navigation_Reflector(self, path_or_query: str) -> str:
         """

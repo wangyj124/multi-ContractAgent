@@ -1,0 +1,3 @@
+- [x] `structural_lookup` finds content for path "第二卷/第三章/3.1" (or similar mis-structured path).
+- [x] `structural_lookup` finds content for path "3.1" (exact match).
+- [x] `structural_lookup` finds content for path "第二卷" (parent match).

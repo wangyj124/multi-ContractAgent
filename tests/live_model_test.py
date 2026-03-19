@@ -23,6 +23,9 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+logging.getLogger("httpx").setLevel(logging.WARNING) 
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # Verify API Key is present
@@ -104,7 +107,7 @@ def main():
 
 
     # 3. Load and chunk contract
-    docx_path = os.path.join(project_root, "data/input/")
+    docx_path = os.path.join(project_root, "data/input/甘露机岛合同-20181211版最终-签字版（无价格版）.docx")
     logger.info(f"正在加载并分块 {docx_path}...")
     if not os.path.exists(docx_path):
         logger.error(f"未找到 {docx_path}！")

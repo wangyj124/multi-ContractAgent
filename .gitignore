@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Data and specific documents
+input/甘露机岛合同-20181211版最终-签字版（无价格版）.docx

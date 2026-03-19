@@ -1,0 +1,5 @@
+- [ ] `HIERARCHY_PATTERNS` correctly identifies "1.", "10(A)", "10(A).1", "Contract Agreement", "Table of Contents".
+- [ ] `_generate_smart_summary` correctly summarizes text > 50 chars using `qwen3-30b-instruct`.
+- [ ] `_generate_smart_summary` correctly handles text < 50 chars (uses original text).
+- [ ] Document tree includes summaries for relevant nodes.
+- [ ] "Contract Agreement" and "Signature Page" are correctly detected and summarized.

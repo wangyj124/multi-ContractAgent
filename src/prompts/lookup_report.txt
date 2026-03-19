@@ -1,0 +1,6 @@
+Here are some search results found for a user query.
+将这些结果总结为一份简明的报告。
+格式：“找到 X 个相关块：\n- [Chunk ID] 摘要...”
+
+Search Results:
+{candidates_text}

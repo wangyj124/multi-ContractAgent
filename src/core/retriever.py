@@ -2,6 +2,7 @@ import uuid
 import hashlib
 import random
 import os
+from tqdm import tqdm
 from typing import List, Dict, Any, Optional, Union
 try:
     from qdrant_client import QdrantClient
@@ -21,6 +22,22 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+
+from src.core.llm import get_llm
+from pathlib import Path
+
+def _load_prompt(prompt_name: str) -> str:
+    base_path = Path(__file__).parent.parent.parent / "src/prompts"
+    prompt_path = base_path / f"{prompt_name}.txt"
+    if not prompt_path.exists():
+         # Fallback try relative path
+         base_path = Path(__file__).parent.parent / "prompts"
+         prompt_path = base_path / f"{prompt_name}.txt"
+         
+    if not prompt_path.exists():
+         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 class Retriever:
     def __init__(self, location: str = ":memory:", collection_name: str = "contract_chunks", embedding_model: str = "mock"):
@@ -49,12 +66,13 @@ class Retriever:
                 print("FastEmbed not available, falling back to mock embeddings.")
                 self.embedding_model = "mock"
         
-        elif self.embedding_model == "openai" or self.embedding_model == "qwen3-embedding":
+        elif self.embedding_model == "openai" or self.embedding_model == "qwen3-embedding-8B":
             if OPENAI_AVAILABLE:
                 base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
                 api_key = os.environ.get("OPENAI_API_KEY", "sk-proj-...")
                 # If model name is just "openai", default to text-embedding-3-small
-                model_name = "text-embedding-3-small" if self.embedding_model == "openai" else self.embedding_model
+                model_name = os.environ.get("MODEL_EMBEDDING") or \
+                     (self.embedding_model if self.embedding_model != "openai" else "qwen3-embedding-8B")
                 
                 self.embedder = OpenAIEmbeddings(
                     model=model_name,
@@ -116,13 +134,26 @@ class Retriever:
         except Exception:
             start_id = 0
 
-        for i, chunk in enumerate(chunks):
+        pbar = tqdm(chunks, desc="正在建立向量索引", unit="chunk")
+
+        for i, chunk in enumerate(pbar):
             # Handle Archivist structure (content vs text)
             text = chunk.get("text") or chunk.get("content")
             if not text:
                 continue
+
+            try:
+                # 获取向量 (Dense Vector)
+                vector = self._get_embedding(text)
                 
-            vector = self._get_embedding(text)
+                # 第一次成功时报一次成功提示
+                if i == 0:
+                    tqdm.write("Successfully connected to Embedding service. Processing remaining chunks...")
+                
+            except Exception as e:
+                # 中途失败时，使用 tqdm.write 避免破坏进度条结构
+                tqdm.write(f"Error at chunk {i}: {str(e)}")
+                continue            
             
             # Create payload
             # Ensure we keep all metadata
@@ -158,6 +189,7 @@ class Retriever:
                 collection_name=self.collection_name,
                 points=points
             )
+        tqdm.write(f"Indexing complete. Total {len(points)} chunks added.")
 
     def get_chunk(self, chunk_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -206,40 +238,104 @@ class Retriever:
 
     def search(self, query: str, k: int = 5, filter: Optional[Union[Dict[str, Any], models.Filter]] = None) -> List[Dict[str, Any]]:
         """
-        Semantic search.
+        Hybrid Search (Semantic + Keyword Boost).
+        
+        Uses Dense Vector Search as the primary retrieval method (Top 2*k),
+        then re-ranks results by boosting scores based on keyword presence.
         
         Args:
             query: Search query
             k: Number of results to return
-            filter: Optional Qdrant filter (dict or Filter object)
+            filter: Optional Qdrant filter
         """
         query_vector = self._get_embedding(query)
         
-        # If filter is a dict, we assume it's a Qdrant Filter structure or custom dict
-        # Ideally, caller should pass models.Filter
-        query_filter = filter
-        
+        # 1. Semantic Search
+        # Note: client.search returns list of ScoredPoint
+        # Use query_points for synchronous client if search is not available
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
-            query_filter=query_filter,
-            limit=k
+            query_filter=filter,
+            limit=k * 2 # Fetch more candidates for re-ranking
         ).points
         
-        return [
-            {
-                "score": hit.score,
-                "payload": hit.payload,
-                "id": hit.id
-            }
-            for hit in search_result
-        ]
+        # 2. Client-side Keyword Boost
+        query_terms = set(query.lower().split())
+        
+        candidates = []
+        for hit in search_result:
+            payload = hit.payload
+            text = (payload.get("text") or payload.get("content") or "").lower()
+            
+            # Calculate term overlap
+            # Simple exact match of terms
+            term_matches = sum(1 for term in query_terms if term in text)
+            
+            # Apply Boost
+            boost = 1.0 + (0.1 * term_matches) 
+            final_score = hit.score * boost
+            
+            candidates.append({
+                "score": final_score,
+                "payload": payload,
+                "id": hit.id,
+                "original_score": hit.score
+            })
+            
+        # Sort by boosted score
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        
+        # 3. LLM Reranking (Optional, Top 5)
+        # Rerank the top candidates using LLM score
+        top_candidates = candidates[:5]
+        
+        # Check if LLM reranking is enabled via env or if we have enough candidates
+        enable_llm_rerank = os.environ.get("ENABLE_LLM_RERANK", "true").lower() == "true"
+        
+        if enable_llm_rerank and top_candidates:
+            llm = get_llm("qwen3-30B-A3B-Instruct", temperature=0)
+            rerank_prompt_template = _load_prompt("lookup_rerank")
+            
+            for cand in top_candidates:
+                content = cand["payload"].get("content", "")[:1000] # Limit content length
+                prompt = rerank_prompt_template.format(query=query, content=content)
+                
+                try:
+                    response = llm.invoke(prompt)
+                    score_str = response.content.strip()
+                    # Extract number from response
+                    import re
+                    match = re.search(r"\d+", score_str)
+                    if match:
+                        llm_score = int(match.group())
+                        # Normalize to 0-1 range and blend with vector score
+                        # Vector score is usually 0.7-0.9. LLM score is 0-10.
+                        # New Score = 0.7 * VectorScore + 0.3 * (LLMScore / 10)
+                        cand["llm_score"] = llm_score
+                        cand["final_score"] = 0.7 * cand["score"] + 0.3 * (llm_score / 10.0)
+                    else:
+                        cand["final_score"] = cand["score"]
+                except Exception as e:
+                    # print(f"Rerank failed: {e}")
+                    cand["final_score"] = cand["score"]
+            
+            # Re-sort based on blended score
+            top_candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+            return top_candidates
+            
+        return candidates[:k]
 
     def search_by_path(self, path_prefix: str) -> List[Dict[str, Any]]:
         """
         Structural lookup by path prefix.
-        Returns a list of payloads (chunks) that match the path prefix.
+        Supports fuzzy matching where path_prefix components match the start of actual path components.
+        e.g. "Chapter 1/1.1" matches "Chapter 1 Introduction/1.1 Definition"
+        Also supports missing or extra levels in the query path.
         """
+        # Normalize query path parts
+        query_parts = [p.strip() for p in path_prefix.split('/') if p.strip()]
+        
         results = []
         offset = None
         while True:
@@ -256,7 +352,27 @@ class Retriever:
             for point in points_result:
                 payload = point.payload or {}
                 path = payload.get("path", "")
-                if path.startswith(path_prefix):
+                
+                # Calculate match score
+                score, last_matched = self._calculate_path_match_score(query_parts, path)
+                
+                # Threshold logic:
+                # 1. If query has multiple parts, we generally require the LAST part to match.
+                #    (e.g. "Vol 2/3.1" should match "3.1" or "Vol 2/3.1", but NOT just "Vol 2")
+                # 2. Score threshold: Allow 1 miss if length > 1.
+                
+                threshold = 1.0
+                if len(query_parts) > 1:
+                    threshold = (len(query_parts) - 1.0) / len(query_parts)
+                    threshold -= 0.01 # Float tolerance
+                
+                # Condition: High score AND (last part matched OR strict perfect match on prefix)
+                # Actually, if last part matches, it's usually what we want.
+                # If last part doesn't match, it might be a parent matching a child query? No, parent matching child query means query has MORE parts.
+                # If query "A/B" matches "A", last part "B" missed.
+                # If query "A" matches "A/B", last part "A" matched.
+                
+                if score >= threshold and (last_matched or len(query_parts) == 1):
                     results.append(payload)
             
             offset = next_offset
@@ -264,3 +380,48 @@ class Retriever:
                 break
                 
         return results
+
+    def _calculate_path_match_score(self, query_parts: List[str], actual_path: str) -> tuple[float, bool]:
+        """
+        Helper to calculate a match score (0.0 to 1.0) between query and actual path.
+        Returns (score, last_part_matched_bool).
+        """
+        if not actual_path or not query_parts:
+            return 0.0, False
+            
+        actual_parts = [p.strip() for p in actual_path.split('/') if p.strip()]
+        
+        matches = 0
+        match_idx = 0
+        last_part_matched = False
+        
+        for idx, q in enumerate(query_parts):
+            q_norm = " ".join(q.split()).lower()
+            
+            # Find fuzzy match in remaining actual parts
+            # We want to support skipping levels if needed, but order matters.
+            # Also support substring match: "2.2" should match "2.2 本合同..."
+            
+            for i in range(match_idx, len(actual_parts)):
+                a = actual_parts[i]
+                a_norm = " ".join(a.split()).lower()
+                
+                # Check for startsWith or contains (if query is specific like 2.2)
+                # If query is "2.2", it should match "2.2 Title"
+                # If query is "Chapter 2", it should match "第二章 Title" (if we handle translation, but here we just do string match)
+                
+                if q_norm in a_norm:
+                    match_idx = i + 1
+                    matches += 1
+                    if idx == len(query_parts) - 1:
+                        last_part_matched = True
+                    break
+        
+        return matches / len(query_parts), last_part_matched
+
+    def _match_path_fuzzy(self, query_parts: List[str], actual_path: str) -> bool:
+        """
+        Deprecated. Use _calculate_path_match_score instead.
+        """
+        score, _ = self._calculate_path_match_score(query_parts, actual_path)
+        return score == 1.0
