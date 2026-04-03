@@ -31,7 +31,8 @@ def _load_prompt(prompt_name: str) -> str:
 # Initialize Retriever and Tools (Globals for now, ideally injected)
 # We use a singleton pattern or just module level for simplicity
 # In a real app, this might be initialized in main and passed around
-_retriever = Retriever(location=":memory:", collection_name="contract_chunks")
+_embedding_model = os.environ.get("MODEL_EMBEDDING", "qwen3-embedding-8B")
+_retriever = Retriever(location=":memory:", collection_name="contract_chunks", embedding_model=_embedding_model)
 _lookup_tools = LookupToolSet(_retriever)
 tools = _lookup_tools.get_tools()
 

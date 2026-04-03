@@ -92,18 +92,26 @@ class Archivist:
         
         # Chapter numbering counter (Level 2)
         self.chapter_counter = 0
-
+        
         def finalize_level_3():
             nonlocal active_level_3_index, active_level_3_text
             if active_level_3_index is not None and active_level_3_index < len(chunks):
+                # 方案二修复：之前 _add_text_chunks 已经把包含标题的当前缓冲文本存进 chunk 了，
+                # 所以 chunk['content'] 里面其实已经包含了最初的标题文本。
+                # 此时 active_level_3_text 中收集的内容，也包含了这部分。
+                # 我们不需要再手动把 title 拼接到前面，直接使用收集到的完整文本即可。
                 full_text = "\n".join(active_level_3_text)
-                if not full_text.strip():
-                    return
                 
                 chunk = chunks[active_level_3_index]
                 title = chunk['metadata']['path'].split('/')[-1]
                 
-                print(f"[数据聚合] 条款 {title} 包含子条款字数: {len(full_text)}", flush=True)
+                if not full_text.strip():
+                    # 如果真的没有收集到任何正文文本，说明这只是个空壳标题
+                    full_text = title
+                    print(f"[数据聚合] 条款 {title} 无子条款，直接保留标题作为内容", flush=True)
+                else:
+                    # 直接使用 full_text，不再做 f"{title}\n{full_text}" 拼接，避免重复
+                    print(f"[数据聚合] 条款 {title} 包含子条款字数: {len(full_text)}", flush=True)
                 
                 # Update chunk content to include full aggregated text
                 chunk['content'] = full_text
@@ -328,14 +336,15 @@ class Archivist:
                         new_title = result
                         # Update all chunks with this title in their path
                         for idx in indices:
+                            # 方案二：不再覆盖真实的 path，而是增加 display_path 字段用于展示大纲
                             path = chunks[idx]["metadata"]["path"]
-                            # Replace the specific part of the path
-                            # Be careful with replace, ensure we target the right segment
-                            # We know it's Level 3 (index 2)
                             parts = path.split("/")
                             if len(parts) > 2 and parts[2] == old_title:
-                                parts[2] = new_title
-                                chunks[idx]["metadata"]["path"] = "/".join(parts)
+                                # 生成供大纲展示的 display_path
+                                display_parts = parts.copy()
+                                display_parts[2] = new_title
+                                chunks[idx]["metadata"]["display_path"] = "/".join(display_parts)
+                                # 注意：保留原始 path 不变，以供底层检索使用
                                 
                 except Exception as e:
                     print(f"[错误] 任务 {task_type} 失败: {e}", flush=True)
@@ -574,8 +583,10 @@ class Archivist:
             return None
 
         for chunk in chunks:
-            path = chunk.get('metadata', {}).get('path', [])
+            # 方案二：大纲生成优先使用 display_path，如果没有则回退使用 path
+            path = chunk.get('metadata', {}).get('display_path') or chunk.get('metadata', {}).get('path', [])
             summary = chunk.get('metadata', {}).get('summary', "")
+            real_path = chunk.get('metadata', {}).get('path', "") # 保留真实路径用于输出
             
             if not path:
                 continue
@@ -588,7 +599,9 @@ class Archivist:
             for i, part in enumerate(path):
                 node = find_child(current_level, part)
                 if not node:
-                    node = {'name': part, 'children': [], 'summary': ""}
+                    # 记录该节点对应的真实完整路径（用于让模型复制去检索）
+                    node_real_path = "/".join(real_path.split('/')[:i+1]) if isinstance(real_path, str) else ""
+                    node = {'name': part, 'children': [], 'summary': "", 'real_path': node_real_path}
                     current_level.append(node)
                     node_count += 1
                 
@@ -607,12 +620,17 @@ class Archivist:
 
             for node in nodes:
                 prefix = "  " * indent + "- "
+                # 方案二：大纲中不仅展示标题，还在后面附上供 structural_lookup 使用的真实路径
                 line = prefix + node['name']
                 
                 # Show summary
                 if node.get('summary'):
                     # Full summary without truncation
                     line += f" (摘要: {node['summary']})"
+                
+                # 附上真实的检索路径指示
+                if node.get('real_path'):
+                    line += f"  [检索路径: '{node['real_path']}']"
                 
                 lines.append(line)
                 build_string(node['children'], indent + 1)

@@ -60,6 +60,8 @@ def main():
     parser = argparse.ArgumentParser(description="Contract Agent Main Flow")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging")
     parser.add_argument("--dummy", action="store_true", help="Use dummy contract data")
+    parser.add_argument("--doc", type=str, help="Path to the document to process")
+    parser.add_argument("--tasks", type=str, help="Path to the Excel tasks file")
     args = parser.parse_args()
     
     setup_logging(args.debug)
@@ -68,7 +70,9 @@ def main():
     
     # 1. Prepare Document
     docx_path = "data/input/contract.docx"
-    if args.dummy:
+    if args.doc:
+        docx_path = args.doc
+    elif args.dummy:
         logger.info("[初始化] 生成测试文档...")
         docx_path = "data/input/dummy_contract.docx"
         generate_dummy_contract(docx_path)
@@ -78,24 +82,36 @@ def main():
         return
 
     # 2. Define Tasks
-    # For testing, we use a fixed list. In production, load from Excel/User input.
-    task_list = [
-        "合同编号", 
-        "买方名称", 
-        "卖方名称", 
-        "合同总价", 
-        "预付款比例",
-        "质保金比例",
-        "交货期", # Might be missing in dummy
-        "签署日期"
-    ]
+    if args.tasks:
+        from src.core.task_init import XTParser
+        try:
+            parser = XTParser(args.tasks)
+            tasks = parser.load_tasks()
+            task_list = [t["focus"] for t in tasks if t.get("focus")]
+            logger.info(f"成功从 {args.tasks} 加载 {len(task_list)} 个任务")
+        except Exception as e:
+            logger.error(f"加载任务文件失败: {e}")
+            return
+    else:
+        # For testing, we use a fixed list. In production, load from Excel/User input.
+        task_list = [
+            "合同编号", 
+            "买方名称", 
+            "卖方名称", 
+            "合同总价", 
+            "预付款比例",
+            "质保金比例",
+            "交货期", # Might be missing in dummy
+            "签署日期"
+        ]
     logger.info(f"[任务列表] 待提取字段 ({len(task_list)}): {task_list}")
 
     # 3. Initialize Core Components
     logger.info("[初始化] 启动 Archivist & Retriever...")
-    archivist = Archivist()
+    embedding_model = os.environ.get("MODEL_EMBEDDING", "qwen3-embedding-8B")
+    archivist = Archivist(embedding_model_name=embedding_model)
     # Use memory for speed
-    retriever = Retriever(location=":memory:", collection_name="contract_chunks")
+    retriever = Retriever(location=":memory:", collection_name="contract_chunks", embedding_model=embedding_model)
     
     # Inject dependencies
     src.agents.nodes._retriever = retriever

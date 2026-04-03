@@ -3,7 +3,8 @@ from langgraph.prebuilt import ToolNode
 from typing import Literal
 
 from src.core.state import FieldState
-from src.agents.nodes import field_supervisor_node, worker_node, validator_node, tools
+from src.agents.nodes import field_supervisor_node, worker_node, validator_node
+import src.agents.nodes as nodes
 
 def create_field_extraction_subgraph():
     """
@@ -12,7 +13,7 @@ def create_field_extraction_subgraph():
     workflow = StateGraph(FieldState)
     
     workflow.add_node("field_supervisor", field_supervisor_node)
-    workflow.add_node("tools", ToolNode(tools, messages_key="field_messages"))
+    workflow.add_node("tools", ToolNode(nodes.tools, messages_key="field_messages"))
     workflow.add_node("worker", worker_node)
     workflow.add_node("validator", validator_node)
     

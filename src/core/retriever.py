@@ -402,15 +402,21 @@ class Retriever:
             # We want to support skipping levels if needed, but order matters.
             # Also support substring match: "2.2" should match "2.2 本合同..."
             
+            # 为了防止过长的路径（带有空格、特殊符号、换行等）在经过模型和系统的传递中变形导致不匹配
+            # 我们截取前 20 个非空字符作为关键特征（因为 20 个字在同一层级下通常已经足够唯一）
+            # 注意这里对中英文混合处理做了一个相对安全的近似截取
+            q_safe = q_norm.replace(" ", "")[:20] if len(q_norm.replace(" ", "")) > 20 else q_norm.replace(" ", "")
+
             for i in range(match_idx, len(actual_parts)):
                 a = actual_parts[i]
                 a_norm = " ".join(a.split()).lower()
+                a_safe = a_norm.replace(" ", "")
                 
                 # Check for startsWith or contains (if query is specific like 2.2)
-                # If query is "2.2", it should match "2.2 Title"
-                # If query is "Chapter 2", it should match "第二章 Title" (if we handle translation, but here we just do string match)
+                # 如果查询词去除了所有空格后，是目标词去除所有空格后的子串（即核心内容一致），即视为匹配
+                # 这样可以完全无视原句中 `万元` 前后的那几个空格到底是全角、半角还是换行
                 
-                if q_norm in a_norm:
+                if q_safe in a_safe:
                     match_idx = i + 1
                     matches += 1
                     if idx == len(query_parts) - 1:
